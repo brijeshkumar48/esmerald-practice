@@ -1,0 +1,2 @@
+[console_scripts]
+esmerald = esmerald.__main__:run_cli

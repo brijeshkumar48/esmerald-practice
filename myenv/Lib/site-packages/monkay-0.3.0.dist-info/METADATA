@@ -1,0 +1,49 @@
+Metadata-Version: 2.4
+Name: monkay
+Version: 0.3.0
+Summary: The ultimate preload, settings, lazy import manager.
+Project-URL: Documentation, https://github.com/devkral/monkay#readme
+Project-URL: Issues, https://github.com/devkral/monkay/issues
+Project-URL: Source, https://github.com/devkral/monkay
+Author-email: alex <devkral@web.de>, Tiago Silva <tiago.arasilva@gmail.com>
+License-File: LICENSE.txt
+Keywords: lazy-imports,monkey-patching,settings
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: License :: OSI Approved :: BSD License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: Implementation :: CPython
+Classifier: Programming Language :: Python :: Implementation :: PyPy
+Classifier: Topic :: Software Development
+Classifier: Topic :: Software Development :: Libraries
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Classifier: Typing :: Typed
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+
+# monkay
+
+[![PyPI - Version](https://img.shields.io/pypi/v/monkay.svg)](https://pypi.org/project/monkay)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/monkay.svg)](https://pypi.org/project/monkay)
+
+-----
+
+## Table of Contents
+
+- [Installation](#installation)
+- [License](#license)
+
+## Installation
+
+```shell
+pip install monkay
+```
+
+## License
+
+`monkay` is distributed under the terms of the [MIT](https://spdx.org/licenses/MIT.html) license.
