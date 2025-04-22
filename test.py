@@ -1,6 +1,6 @@
 import asyncio
 from bson import ObjectId
-from app.models.file_model import Student
+from app.models.app_models import Student
 
 async def insert_student():
     student_data = {

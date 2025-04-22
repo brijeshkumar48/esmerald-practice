@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 from bson import ObjectId
 from esmerald import Form, Query, Response, get, post, delete, Request, status
 from app.commonDao import CommonDAO
-from app.models.file_model import Student, UploadedMediaFile
+from app.models.app_models import Address, School, Student, UploadedMediaFile
 from app.models.stuDao import StudentDAO
 from app.utils import generate_response
 
@@ -66,6 +66,44 @@ async def delete_file(request: Request, upload_file_id: str) -> Response:
         )
 
 
+@post(path="/students", tags=["Students"])
+async def create_student(request: Request,  **kwargs: Any,) -> Response:
+    data = await request.json()
+
+    # 1. Extract school and create school document
+    school = data.get("school", {})
+    school_doc = {
+        "name": school.get("name"),
+        "board": school.get("board")
+    }
+
+    school_obj = await School.objects.create(**school_doc)
+    school_id = school_obj.id
+
+    # 2. Prepare embedded address
+    address_data = data.get("address", {})
+    address = Address(
+        village=address_data.get("village"),
+        state=address_data.get("state"),
+        pincode=address_data.get("pincode")
+    )
+
+    # 3. Create student with FK to school
+    student = Student(
+        name=data.get("name"),
+        std=data.get("std"),
+        school_id=school_id,
+        address=address
+    )
+    await student.save()
+
+    return generate_response(
+        request=request,
+        data={},
+        message="Ok"
+    )
+
+
 @get("/student")
 async def stu_details(
     request: Request, 
@@ -78,7 +116,7 @@ async def stu_details(
     # stu = await student_dao.get_all()
 
     stu = await student_dao.search(
-    params=q,
+    query_params=q,
     projection=[
             "name",
             "std",

@@ -1,11 +1,12 @@
 from mongoz import String, Document, fields
-from typing import Annotated, ClassVar, List
+from typing import Annotated, Any, ClassVar, List, Optional, Type
 
 import mongoz
 from pydantic import Field
 from app.baseModel import BaseDocument
 from db.registry import registry
 from bson import ObjectId
+
 
 FileUploadResultTypeChoices = (
     ("SN", "SystemNudge"),
@@ -35,7 +36,7 @@ SchoolBoardChoices = (
     ("IC", "ICSC"),
 )
 
-class School(mongoz.EmbeddedDocument):
+class School(BaseDocument):
     name: str = mongoz.String()
     board: str = mongoz.String(choices = SchoolBoardChoices)
 
@@ -82,7 +83,4 @@ class Student(BaseDocument):
     @staticmethod
     def get_dbtype():
         return "students"
-
-
-
 

@@ -41,41 +41,72 @@ class CommonDAO(AsyncDAOProtocol):
 
         return convert(doc)
     
-    def extract_lookups_from_params(
+
+    def extract_lookup_stages_and_filters(
         self,
         model,
-        params: Dict[str, Any]
+        query_params: Dict[str, Any]
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-        lookups = {}
-        base_params = {}
-        lookup_params = {}
+        """
+        Extracts MongoDB $lookup stages and separates query parameters into base and lookup-related filters.
 
-        for key, value in params.items():
-            if "." in key:
-                local_field, rest = key.split(".", 1)
+        This method identifies which query parameters refer to fields that require `$lookup` 
+        (i.e., foreign key or related collection references). It constructs the necessary 
+        `$lookup` pipeline stages and separates the parameters accordingly.
 
-                model_field = model.model_fields.get(local_field)
+        Parameters:
+        ----------
+        model : MongozDocument
+            The Mongoz model class for which the query is being performed.
+        query_params : Dict[str, Any]
+            A dictionary of query parameters, potentially including fields that span relationships.
+
+        Returns:
+        -------
+        Tuple[
+            List[Dict[str, Any]],  # List of $lookup stage definitions
+            Dict[str, Any],        # Base query filters (non-related fields or embedded fields)
+            Dict[str, Any]         # Related model query filters (requiring lookup joins)
+        ]
+        """
+        lookup_stages: Dict[str, Dict[str, Any]] = {}
+        base_filters: Dict[str, Any] = {}
+        related_model_filters: Dict[str, Any] = {}
+
+        for field_key, field_value in query_params.items():
+            if "." in field_key:
+                # Handle foreign key or related model field (e.g., "school_id.name")
+                base_field, nested_field = field_key.split(".", 1)
+
+                model_field = model.model_fields.get(base_field)
                 if model_field and model_field.annotation.__name__ == "EmbeddedDocument":
-                    base_params[key] = value
+                    # Embedded fields are part of the same document, treat as base filter
+                    base_filters[field_key] = field_value
                     continue
 
-                collection = self.get_lookup_collection(model, local_field)
-                if collection:
-                    if local_field not in lookups:
-                        lookups[local_field] = {
-                            "from": collection,
-                            "localField": local_field,
+                # Check if the field is a valid reference and fetch the corresponding collection
+                referenced_collection = self.get_lookup_collection(model, base_field)
+                if referenced_collection:
+                    # Create $lookup stage if not already created
+                    if base_field not in lookup_stages:
+                        lookup_stages[base_field] = {
+                            "from": referenced_collection,
+                            "localField": base_field,
                             "foreignField": "_id",
-                            "as": local_field
+                            "as": base_field
                         }
-                    lookup_params[f"{local_field}.{rest}"] = value
+                    # Store filters specific to the joined collection
+                    related_model_filters[f"{base_field}.{nested_field}"] = field_value
                 else:
-                    base_params[key] = value
+                    # If no collection found, treat it as a regular field
+                    base_filters[field_key] = field_value
             else:
-                base_params[key] = value
+                # Plain field in the base model
+                base_filters[field_key] = field_value
 
-        return list(lookups.values()), base_params, lookup_params
-    
+        # Return the $lookup definitions, base filters, and related model filters
+        return list(lookup_stages.values()), base_filters, related_model_filters
+
     def query_builder(self, filters: Dict[str, Any]) -> Dict[str, Any]:
         query = {}
         for key, value in filters.items():
@@ -121,103 +152,135 @@ class CommonDAO(AsyncDAOProtocol):
         meta = field_info.json_schema_extra.get("Meta", {})
         return meta.get("ref_model")
 
+    from typing import Dict, Any, Optional, List, Tuple, Union
+
     async def search(
         self,
-        params: Dict[str, Any] = {},
-        projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
-        sort: Optional[Dict[str, int]] = None,
-        group_by: Optional[str] = None,
+        query_params: Dict[str, Any] = {},
+        projection_fields: Optional[List[Union[str, Tuple[str, str]]]] = None,
+        sort_criteria: Optional[Dict[str, int]] = None,
+        group_by_field: Optional[str] = None,
         unwind_fields: Optional[List[str]] = [],
     ) -> List[Dict[str, Any]]:
-        params = params or {}
-        skip = int(params.pop("skip", 0))
-        pick = int(params.pop("pick", 0))
+        """
+        Performs an aggregated search on the model's collection with optional filtering, sorting, 
+        projection, grouping and pagination.
 
-        lookups, base_params, lookup_params = self.extract_lookups_from_params(self.model, params)
-        base_query = self.query_builder(base_params)
-        lookup_query = self.query_builder(lookup_params)
+        This method builds a MongoDB aggregation pipeline to search the collection, including 
+        handling embedded or foreign key fields through lookups, applying filters, projections, 
+        sorting, and pagination based on the provided parameters.
 
+        Parameters:
+        ----------
+        query_params : Dict[str, Any]
+            A dictionary of query parameters that includes filter conditions, skip, and pick values.
+        projection_fields : Optional[List[Union[str, Tuple[str, str]]]]
+            A list of fields to be included in the result set, with optional aliases for nested fields.
+        sort_criteria : Optional[Dict[str, int]]
+            A dictionary specifying the sorting order (1 for ascending, -1 for descending).
+        group_by_field : Optional[str]
+            Field to group results by. Not currently implemented in this function.
+        unwind_fields : Optional[List[str]]
+            A list of fields to be unwound in the aggregation pipeline (for arrays).
+
+        Returns:
+        -------
+        List[Dict[str, Any]]
+            A list of documents from the collection that match the search criteria, transformed into
+            a serializable format.
+        """
+        query_params = query_params or {}
+        skip_count = int(query_params.pop("skip", 0))
+        limit_count = int(query_params.pop("pick", 0))
+
+        # Extract lookups and separate query parameters into base and lookup filters
+        lookups, base_filters, lookup_filters = self.extract_lookup_stages_and_filters(self.model, query_params)
+
+        # Initialize the aggregation pipeline and other variables
         pipeline = []
-        existing_lookups = set()
-        project_stage = {}
+        processed_lookups = set()
+        projection_stage = {}
 
-        def add_lookup_stage(lookup):
-            if lookup["as"] in existing_lookups:
+        # Helper function to add a lookup stage to the pipeline
+        def add_lookup_stage(lookup: Dict[str, Any]):
+            if lookup["as"] in processed_lookups:
                 return
+            # Add $lookup stage for related collection
             pipeline.append({"$lookup": lookup})
+            # Add $unwind stage for flattening the lookup results
             pipeline.append({
                 "$unwind": {
                     "path": f"${lookup['as']}",
-                    "preserveNullAndEmptyArrays": True
+                    "preserveNullAndEmptyArrays": True  # Allow nulls if no match in the lookup collection
                 }
             })
-            existing_lookups.add(lookup["as"])
+            processed_lookups.add(lookup["as"])
 
-        # Match base query early
-        if base_query:
+        # Apply filters for the base (non-related) fields
+        if base_filters:
+            # Build query for base filters
+            base_query = self.query_builder(base_filters)
             pipeline.append({"$match": base_query})
 
-        # Add lookups early for lookup query use
-        for lookup in lookups:
-            add_lookup_stage(lookup)
-
-        # Match joined fields only after lookups
-        if lookup_query:
+        # Apply filters for the related models (those requiring lookups)
+        if lookup_filters:
+            # Build query for lookup filters
+            lookup_query = self.query_builder(lookup_filters)
+            for lookup in lookups:
+                add_lookup_stage(lookup)
             pipeline.append({"$match": lookup_query})
 
-        if projection:
-            for field in projection:
+        # Apply projections (fields to return) with optional aliases for nested fields
+        if projection_fields:
+            for field in projection_fields:
                 if isinstance(field, str):
-                    project_stage[field] = 1
+                    projection_stage[field] = 1
                 elif isinstance(field, tuple):
                     path, alias = field
                     if "." in path:
-                        local_field, foreign_field = path.split(".")
-                        related_collection = self.get_lookup_collection(self.model, local_field)
+                        # For nested fields (e.g., "address.city"), project them with an alias
+                        projection_stage[alias] = f"${path}"
 
-                        if related_collection and local_field not in existing_lookups:
-                            add_lookup_stage({
-                                "from": related_collection,
-                                "localField": local_field,
-                                "foreignField": "_id",
-                                "as": local_field
-                            })
-
-                        project_stage[alias] = f"${path}"
+        # Default projection: include fields and nested fields for related models
         else:
             for field_name, field in self.model.model_fields.items():
                 meta = (field.json_schema_extra or {}).get("Meta", {})
                 related_model = meta.get("ref_model")
+                # <class 'app.models.app_models.School'>
                 related_collection = meta.get("ref")
+                # related_collection = 'schools'
 
+                # Handle related models with references (e.g., foreign key)
                 if related_model and related_collection:
-                    add_lookup_stage({
-                        "from": related_collection,
-                        "localField": field_name,
-                        "foreignField": "_id",
-                        "as": field_name
-                    })
-                    for related_field in related_model.model_fields:
-                        if related_field == "id":
-                            continue
-                        alias = f"{field_name.replace('_id', '')}_{related_field}"
-                        project_stage[alias] = f"${field_name}.{related_field}"
-                elif hasattr(field.annotation, "model_fields"):
-                    for embedded_field in field.annotation.model_fields:
-                        project_stage[embedded_field] = f"${field_name}.{embedded_field}"
-                else:
-                    project_stage[field_name] = 1
+                    projection_stage.update(dict(map(
+                        lambda f: (f"{field_name.replace('_id', '')}_{f}", f"${field_name}.{f}"),
+                        filter(lambda f: f != "id", related_model.model_fields)
+                    )))
 
-        if project_stage:
-            pipeline.append({"$project": project_stage})
-        if sort:
-            pipeline.append({"$sort": sort})
-        if skip:
-            pipeline.append({"$skip": skip})
-        if pick:
-            pipeline.append({"$limit": pick})
+                # Handle embedded models (fields with their own model fields)
+                elif hasattr(field.annotation, "model_fields"):
+                    projection_stage.update(dict(map(
+                        lambda f: (f, f"${field_name}.{f}"),
+                        field.annotation.model_fields
+                    )))
+
+                else:
+                    # Include non-related field in projection
+                    projection_stage[field_name] = 1
+
+        if projection_stage:
+            pipeline.append({"$project": projection_stage})
+
+        if sort_criteria:
+            pipeline.append({"$sort": sort_criteria})
+
+        if skip_count:
+            pipeline.append({"$skip": skip_count})
+        if limit_count:
+            pipeline.append({"$limit": limit_count})
 
         results = await self.collection.aggregate(pipeline, allowDiskUse=True).to_list(length=None)
+
         return [self.convert_to_serializable(doc) for doc in results]
 
 

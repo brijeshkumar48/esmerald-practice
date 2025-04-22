@@ -1,5 +1,5 @@
 from app.commonDao import CommonDAO
-from app.models.file_model import Student
+from app.models.app_models import Student
 
 
 class StudentDAO(CommonDAO):
