@@ -116,7 +116,7 @@ async def stu_details(
     # stu = await student_dao.get_all()
 
     stu = await student_dao.search(
-    query_params=q,
+    params=q,
     projection=[
             "name",
             "std",

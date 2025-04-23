@@ -1,11 +1,36 @@
 from mongoz import String, Document, fields
-from typing import Annotated, Any, ClassVar, List, Optional, Type
-
+from typing import Annotated, Any, ClassVar, List, Optional, Type, Union
 import mongoz
 from pydantic import Field
 from app.baseModel import BaseDocument
 from db.registry import registry
 from bson import ObjectId
+from mongoz import Document, EmbeddedDocument
+from mongoz.core.db.fields.core import FieldFactory
+from mongoz.core.db.fields.base import BaseField
+
+
+class ForeignKey(FieldFactory):
+    _type = ObjectId
+
+    def __new__(
+        cls,
+        model: Union[Type[Document], Type[EmbeddedDocument]],
+        null: bool = False,
+        **kwargs: Any,
+    ) -> BaseField:
+        kwargs = {
+            **kwargs,
+            "null": null,
+            "json_schema_extra": {
+                "Meta": {
+                    "ref": model.__name__,
+                    "ref_model": model,
+                }
+            },
+        }
+        return super().__new__(cls, **kwargs)
+
 
 
 FileUploadResultTypeChoices = (
@@ -66,14 +91,7 @@ class Address(mongoz.EmbeddedDocument):
 class Student(BaseDocument):
     name: str = mongoz.String()
     std: str = mongoz.String()
-    school_id: ObjectId = Field(
-        json_schema_extra={
-            "Meta": {
-                "ref": "schools",
-                "ref_model": School
-            }
-        }
-    )
+    school_id: ObjectId = ForeignKey(School)
     address: Address = mongoz.EmbeddedDocument()
 
     class Meta:
