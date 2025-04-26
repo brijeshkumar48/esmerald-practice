@@ -7,13 +7,14 @@ from esmerald import Response, Request
 
 logger = logging.getLogger(__name__)
 
+
 def generate_response(
     request: Request,
     data: dict | list,
     message: str,
     info: list = None,
     background: Optional[Union[BackgroundTask, BackgroundTasks]] = None,
-    extra_headers: dict = None
+    extra_headers: dict = None,
 ) -> Response:
     try:
         response_headers = {
@@ -31,13 +32,13 @@ def generate_response(
 
         response_dict = {"message": message, "data": data}
 
-        response =  Response(
-            response_dict,
-            headers=response_headers,
-            background=background
+        response = Response(
+            response_dict, headers=response_headers, background=background
         )
         return response
 
     except Exception as e:
         logger.error(e)
-        return Response(content={"message": f"Internal Server Error:{e}"}, status_code=500)
+        return Response(
+            content={"message": f"Internal Server Error:{e}"}, status_code=500
+        )

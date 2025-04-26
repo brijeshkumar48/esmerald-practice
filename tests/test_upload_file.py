@@ -22,7 +22,7 @@ class TestUploadFile:
                 response = await client.post(
                     upload_url,
                     files={"path": ("sample.txt", f, "text/plain")},
-                    data={"type": "text"}
+                    data={"type": "text"},
                 )
 
         assert response.status_code == 201

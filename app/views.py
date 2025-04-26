@@ -48,34 +48,32 @@ async def upload_file(
 @delete("/{upload_file_id:str}", status_code=status.HTTP_200_OK)
 async def delete_file(request: Request, upload_file_id: str) -> Response:
     try:
-        instance = await UploadedMediaFile.objects.get(id=ObjectId(upload_file_id))
+        instance = await UploadedMediaFile.objects.get(
+            id=ObjectId(upload_file_id)
+        )
         print("==================", instance)
         # Uncomment this if you want to delete the file
         # await instance.delete()
 
         return generate_response(
-            request=request,
-            data={},
-            message="File deleted successfully"
+            request=request, data={}, message="File deleted successfully"
         )
     except Exception as e:
         return generate_response(
-            request=request,
-            data={},
-            message=f"Error: {str(e)}"
+            request=request, data={}, message=f"Error: {str(e)}"
         )
 
 
 @post(path="/students", tags=["Students"])
-async def create_student(request: Request,  **kwargs: Any,) -> Response:
+async def create_student(
+    request: Request,
+    **kwargs: Any,
+) -> Response:
     data = await request.json()
 
     # 1. Extract school and create school document
     school = data.get("school", {})
-    school_doc = {
-        "name": school.get("name"),
-        "board": school.get("board")
-    }
+    school_doc = {"name": school.get("name"), "board": school.get("board")}
 
     school_obj = await School.objects.create(**school_doc)
     school_id = school_obj.id
@@ -85,7 +83,7 @@ async def create_student(request: Request,  **kwargs: Any,) -> Response:
     address = Address(
         village=address_data.get("village"),
         state=address_data.get("state"),
-        pincode=address_data.get("pincode")
+        pincode=address_data.get("pincode"),
     )
 
     # 3. Create student with FK to school
@@ -93,38 +91,43 @@ async def create_student(request: Request,  **kwargs: Any,) -> Response:
         name=data.get("name"),
         std=data.get("std"),
         school_id=school_id,
-        address=address
+        address=address,
     )
     await student.save()
 
-    return generate_response(
-        request=request,
-        data={},
-        message="Ok"
-    )
+    return generate_response(request=request, data={}, message="Ok")
 
 
 @get("/student")
 async def stu_details(
-    request: Request, 
-    q: Optional[Dict[str, Any]] = Query(default=None), 
-    **kwargs: Any
-    ) -> Response:
+    request: Request,
+    q: Optional[Dict[str, Any]] = Query(default=None),
+    **kwargs: Any,
+) -> Response:
     """Get student details."""
     student_dao = StudentDAO(db="test_database")
 
     # stu = await student_dao.get_all()
 
     stu = await student_dao.search(
-    params=q,
-    projection=[
+        params=q,
+        projection=[
             "name",
             "std",
             ("address.state", "state"),
             ("address.pincode", "pincode"),
+            ("address.country_id.country_name", "country_name"),
+            ("address.country_id._id", "country_id"),
+            (
+                "address.country_id.continent_id.continent_name",
+                "continent_name",
+            ),
             ("school_id.name", "school_name"),
             ("school_id.board", "school_board"),
-        ]
+            ("school_id._id", "school_id"),
+            ("school_id.university_id.un_name", "university_name"),
+            ("school_id.university_id._id", "university_id"),
+        ],
     )
 
     return generate_response(
@@ -133,15 +136,13 @@ async def stu_details(
         message="Ok",
     )
 
+
 @post("/create_stu")
-async def insert_student(
-    request: Request, 
-    **kwargs: Any
-    ) -> Response:
+async def insert_student(request: Request, **kwargs: Any) -> Response:
     student_data = {
         "name": "John Doe",
         "std": "10th",
-        "school_id": ObjectId("60c72b2f9b1e8b8b8b8b8b9b")
+        "school_id": ObjectId("60c72b2f9b1e8b8b8b8b8b9b"),
     }
 
     # Insert the student document into the collection

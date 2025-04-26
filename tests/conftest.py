@@ -1,6 +1,7 @@
 import os
 import pytest
 
+
 @pytest.fixture
 def upload_url():
     return "http://127.0.0.1:8000/upload-file"

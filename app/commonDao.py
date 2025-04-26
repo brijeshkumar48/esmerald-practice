@@ -1,5 +1,15 @@
 from pprint import pformat
-from typing import Any, Dict, List, Optional, Union, Tuple, get_type_hints, Annotated, get_args
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Union,
+    Tuple,
+    get_type_hints,
+    Annotated,
+    get_args,
+)
 
 from pydantic import Field
 from app.baseModel import BaseDocument
@@ -25,10 +35,12 @@ class CommonDAO(AsyncDAOProtocol):
 
     def qs(self):
         if not hasattr(self.model, "objects") or self.model.objects is None:
-            raise RuntimeError(f"Model {self.model.__name__} does not have a valid 'objects' manager.")
+            raise RuntimeError(
+                f"Model {self.model.__name__} does not have a valid 'objects' manager."
+            )
         obj = self.model.objects.using(self.db)
         return obj
-    
+
     def convert_to_serializable(self, doc: dict) -> dict:
         def convert(value):
             if isinstance(value, ObjectId):
@@ -40,7 +52,7 @@ class CommonDAO(AsyncDAOProtocol):
             return value
 
         return convert(doc)
-    
+
     def query_builder(self, filters: Dict[str, Any]) -> Dict[str, Any]:
         query = {}
         for key, value in filters.items():
@@ -59,7 +71,9 @@ class CommonDAO(AsyncDAOProtocol):
                 elif op == "gte":
                     query[field] = {"$gte": value}
                 elif op == "in":
-                    query[field] = {"$in": value if isinstance(value, list) else [value]}
+                    query[field] = {
+                        "$in": value if isinstance(value, list) else [value]
+                    }
                 elif op == "contain":
                     query[field] = {"$regex": value, "$options": "i"}
                 elif op == "sw":
@@ -70,14 +84,516 @@ class CommonDAO(AsyncDAOProtocol):
                 query[key] = value
         return query
 
+    def _build_flattened_projection(self, model, parent_field=""):
+        """
+        Recursively builds a flattened MongoDB $project stage for a model.
+        - Handles foreign key relations (references) and embedded documents.
+        - Flattens nested fields into a simple key -> field mapping.
 
+        Args:
+            model: The Mongoz model to process.
+            parent_field: The current field path (used for recursion).
+
+        Returns:
+            dict: A projection dictionary suitable for MongoDB aggregation.
+        """
+        proj = {}  # Final projection dictionary
+        fields = model.model_fields  # Get all fields of the model
+
+        for model_field, field in fields.items():
+            # Build full field path (e.g., "school_id.name" or "address.pincode")
+            full_field = (
+                f"{parent_field}.{model_field}"
+                if parent_field
+                else model_field
+            )
+
+            # --- Handle ForeignKey (Reference field) ---
+            if hasattr(field, "model"):
+                # Reference fields: Store the _id directly
+                proj[model_field] = f"${full_field}._id"
+
+                # Recursively flatten the referenced model fields
+                proj.update(
+                    self._build_flattened_projection(field.model, full_field)
+                )
+                continue  # Move to next field
+
+            # --- Handle EmbeddedDocument (Nested object) ---
+            if hasattr(field.annotation, "model_fields"):
+                for (
+                    sub_field_name,
+                    sub_field,
+                ) in field.annotation.model_fields.items():
+                    # Build full nested path (e.g., "address.country.name")
+                    nested_full_field = f"{full_field}.{sub_field_name}"
+
+                    if hasattr(sub_field, "model"):
+                        # If sub-field is again a ForeignKey inside embedded
+                        proj[sub_field_name] = f"${nested_full_field}._id"
+                        proj.update(
+                            self._build_flattened_projection(
+                                sub_field.model, nested_full_field
+                            )
+                        )
+                    elif hasattr(sub_field.annotation, "model_fields"):
+                        # If sub-field is another level of EmbeddedDocument
+                        proj.update(
+                            self._build_flattened_projection(
+                                sub_field.annotation, nested_full_field
+                            )
+                        )
+                    else:
+                        # Simple field inside embedded document
+                        proj[sub_field_name] = f"${nested_full_field}"
+                continue  # Move to next top-level field
+
+            # --- Handle Simple Fields (Normal fields like string, int) ---
+            proj[model_field] = f"${full_field}"
+
+        return proj
+
+    def _extract_lookups_from_params(
+        self,
+        model,
+        params: Dict[str, Any],
+        projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
+    ) -> tuple[list[dict], dict, dict]:
+        """
+        Optimized dynamic deep lookup extractor with proper unwind handling.
+        - Dynamically builds MongoDB $lookup and $unwind stages for nested relations.
+        - Separates parameters into base fields and lookup fields.
+        """
+
+        # Stores lookup definitions for nested references
+        lookups = {}
+        # Stores params that don't require lookup (base model fields)
+        base_params = {}
+        # Stores params that require lookup (related model fields)
+        lookup_params = {}
+
+        def is_embedded_field(model_field) -> bool:
+            """Checks if the given field is an embedded model (not a foreign relation)."""
+            return hasattr(model_field.annotation, "model_fields")
+
+        def add_lookup_chain(field_path: str):
+            """
+            Builds lookup chain for a given dotted path (e.g., 'school_id.university_id.name').
+            Registers a $lookup for each referenced model encountered.
+            """
+            parts = field_path.split(".")
+            current_model = model
+            current_path = ""
+
+            for index, part in enumerate(parts):
+                model_field = current_model.model_fields.get(part)
+                if not model_field:
+                    # Stop if the field doesn't exist
+                    break
+
+                # Build the full path progressively (e.g., 'school_id', then 'school_id.university_id', etc.)
+                full_path = f"{current_path}.{part}" if current_path else part
+
+                if hasattr(model_field, "model"):
+                    # If it's a referenced model (foreign key style), create a lookup if not already added
+                    if full_path not in lookups:
+                        collection = (
+                            model_field.model.meta.collection._collection.name
+                        )
+                        lookups[full_path] = {
+                            "from": collection,
+                            "localField": full_path,
+                            "foreignField": "_id",
+                            "as": full_path,
+                            # Prepare for possible later optimization (e.g., filtering inside lookup)
+                            "pipeline": [],
+                        }
+                    # Move to next model level for deep chains
+                    current_model = model_field.model
+                    current_path = full_path
+
+                elif is_embedded_field(model_field):
+                    # If it's an embedded document, drill down without lookup
+                    current_model = model_field.annotation
+                    current_path = full_path
+
+                else:
+                    # Scalar field, stop further drilling
+                    break
+
+        # --- Parse and classify params ---
+        for param_key, param_value in params.items():
+            # Handle query operators like '__contain', etc.
+            base_field_path = param_key.split("__")[0]
+            if "." in base_field_path:
+                # If param involves a related field (needs lookup)
+                add_lookup_chain(base_field_path)
+                lookup_params[param_key] = param_value
+            else:
+                # Base field, no lookup needed
+                base_params[param_key] = param_value
+
+        # --- Parse projections for additional lookups ---
+        if projection:
+            for projected_field in projection:
+                field_path = (
+                    projected_field[0]
+                    if isinstance(projected_field, tuple)
+                    else projected_field
+                )
+                if "." in field_path:
+                    # If a projection requires accessing a nested model field
+                    add_lookup_chain(field_path)
+
+        # --- Build lookup and unwind aggregation stages ---
+        lookup_stages = []
+        for full_path, lookup in lookups.items():
+            # Build $lookup stage
+            lookup_stage = {
+                "$lookup": {
+                    "from": lookup["from"],
+                    "localField": lookup["localField"],
+                    "foreignField": lookup["foreignField"],
+                    "as": lookup["as"],
+                }
+            }
+            lookup_stages.append(lookup_stage)
+
+            # Build $unwind stage to flatten lookup result arrays
+            unwind_stage = {
+                "$unwind": {
+                    "path": f"${lookup['as']}",
+                    # Keep documents even if no matching lookup
+                    "preserveNullAndEmptyArrays": True,
+                }
+            }
+            lookup_stages.append(unwind_stage)
+
+        return lookup_stages, base_params, lookup_params
+
+    async def search(
+        self,
+        params: Dict[str, Any] = {},
+        projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
+        sort: Optional[Dict[str, int]] = None,
+        group_by_field: Optional[str] = None,
+        unwind_fields: Optional[List[str]] = [],
+    ) -> List[Dict[str, Any]]:
+        """
+        Highly optimized search using smarter lookup generation and unwind handling.
+        - Dynamically builds aggregation pipelines with lookups, matches, projections, sorting, and pagination.
+        example::
+        http://localhost:8000/api/stu/student?sort=-school_id.name&address.country_id.country_name__sw=I
+
+        http://localhost:8000/api/stu/student?sort=-school_id.name&address.country_id.continent_id.continent_name__eq=Asia
+
+        search(
+        params=q,
+        projection=[
+                "name",
+                "std",
+                ("address.state", "state"),
+                ("address.pincode", "pincode"),
+                ("address.country_id.country_name", "country_name"),
+                ("address.country_id._id", "country_id"),
+                (
+                    "address.country_id.continent_id.continent_name",
+                    "continent_name",
+                ),
+                ("school_id.name", "school_name"),
+                ("school_id.board", "school_board"),
+                ("school_id._id", "school_id"),
+                ("school_id.university_id.un_name", "university_name"),
+                ("school_id.university_id._id", "university_id"),
+            ],
+        )
+
+        """
+        # Initialize params and pipeline components
+        params = params or {}
+        pipeline = []
+        projection_stage = {}
+        combined_query = {}
+        sort_criteria = {}
+
+        # Extract skip and limit for pagination
+        skip_count = int(params.pop("skip", 0))
+        limit_count = int(params.pop("pick", 0))
+
+        # --- Parse sort fields ---
+        sort_param = params.pop("sort", None)
+        if sort_param:
+            for field in sort_param.split(","):
+                if field.startswith("-"):
+                    # Descending sort
+                    sort_criteria[field[1:]] = -1
+                else:
+                    # Ascending sort
+                    sort_criteria[field] = 1
+
+        # --- Prepare dynamic lookups based on params and projections ---
+        lookup_stages, base_filters, lookup_filters = (
+            self._extract_lookups_from_params(self.model, params, projection)
+        )
+
+        # Add lookup stages (with $lookup and $unwind) into the pipeline
+        pipeline.extend(lookup_stages)
+
+        # --- Match stage: Combine base and lookup filters ---
+        if base_filters:
+            combined_query.update(self.query_builder(base_filters))
+        if lookup_filters:
+            combined_query.update(self.query_builder(lookup_filters))
+
+        if combined_query:
+            pipeline.append({"$match": combined_query})
+
+        # --- Sort stage ---
+        if sort_criteria:
+            pipeline.append({"$sort": sort_criteria})
+
+        # --- Build projection stage ---
+        if projection:
+            # If custom projection is provided
+            for item in projection:
+                if isinstance(item, str):
+                    projection_stage[item] = 1
+                elif isinstance(item, tuple):
+                    field_path, alias = item
+                    projection_stage[alias] = f"${field_path}"
+        else:
+            # Default: Deep flatten everything
+            projection_stage = self._build_flattened_projection(self.model)
+
+        # Add projection stage to pipeline
+        if projection_stage:
+            pipeline.append({"$project": projection_stage})
+
+        # --- Pagination stages ---
+        if skip_count:
+            pipeline.append({"$skip": skip_count})
+        if limit_count:
+            pipeline.append({"$limit": limit_count})
+
+        results = await self.collection.aggregate(
+            pipeline, allowDiskUse=True
+        ).to_list(length=None)
+
+        return [self.convert_to_serializable(doc) for doc in results]
+
+    #######################################
+    #############Code is working for any scenario==========
+    #######################################
+    # def extract_lookups_from_params(
+    #     self,
+    #     model,
+    #     params: Dict[str, Any],
+    #     projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
+    # ) -> tuple[list[dict], dict, dict]:
+    #     """
+    #     Handles deep nested lookups and embedded fields dynamically.
+    #     """
+    #     lookups = {}
+    #     base_params = {}
+    #     lookup_params = {}
+
+    #     def is_embedded_field(model_field) -> bool:
+    #         return hasattr(model_field.annotation, "model_fields")
+
+    #     def add_lookup_chain(field_path: str):
+    #         """
+    #         Recursively prepare lookups for each level of the path.
+    #         Example: school_id.university_id.country_id -> three lookups.
+    #         """
+    #         parts = field_path.split(".")
+    #         current_model = model
+    #         current_path = ""
+
+    #         for i, part in enumerate(parts):
+    #             model_field = current_model.model_fields.get(part)
+    #             if not model_field:
+    #                 break
+
+    #             full_path = f"{current_path}.{part}" if current_path else part
+
+    #             if hasattr(model_field, "model"):
+    #                 if full_path not in lookups:
+    #                     collection = (
+    #                         model_field.model.meta.collection._collection.name
+    #                     )
+    #                     lookups[full_path] = {
+    #                         "from": collection,
+    #                         "localField": full_path,
+    #                         "foreignField": "_id",
+    #                         "as": full_path,
+    #                     }
+    #                 current_model = model_field.model
+    #                 current_path = full_path
+
+    #             elif is_embedded_field(model_field):
+    #                 current_model = model_field.annotation
+    #                 current_path = full_path
+    #             else:
+    #                 break
+
+    #     # --- Parse params ---
+    #     for param_key, param_value in params.items():
+    #         clean_key = param_key.split("__")[0]  # Remove __ operators
+    #         if "." in clean_key:
+    #             add_lookup_chain(clean_key)
+    #             if "__" in param_key:
+    #                 lookup_params[param_key] = param_value
+    #             else:
+    #                 lookup_params[param_key] = param_value
+    #         else:
+    #             base_params[param_key] = param_value
+
+    #     # --- Parse projection ---
+    #     if projection:
+    #         for projected_field in projection:
+    #             field_path = (
+    #                 projected_field[0]
+    #                 if isinstance(projected_field, tuple)
+    #                 else projected_field
+    #             )
+    #             if "." in field_path:
+    #                 add_lookup_chain(field_path)
+
+    #     # --- Build lookup stages ---
+    #     lookup_stages = []
+    #     for local_field, lookup in lookups.items():
+    #         lookup_stages.append({"$lookup": lookup})
+    #         lookup_stages.append(
+    #             {
+    #                 "$unwind": {
+    #                     "path": f"${lookup['as']}",
+    #                     "preserveNullAndEmptyArrays": True,
+    #                 }
+    #             }
+    #         )
+
+    #     return lookup_stages, base_params, lookup_params
+
+    # async def search(
+    #     self,
+    #     params: Dict[str, Any] = {},
+    #     projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
+    #     sort_criteria: Optional[Dict[str, int]] = None,
+    #     group_by_field: Optional[str] = None,
+    #     unwind_fields: Optional[List[str]] = [],
+    # ) -> List[Dict[str, Any]]:
+    #     """
+    #     Sorting:
+    #     http://localhost:8000/api/stu/student?name__sw=R&sort=name,school_id.name
+    #     """
+
+    #     # --- Extract & parse pagination ---
+    #     params = params or {}
+    #     pipeline = []
+    #     processed_lookups = set()
+    #     projection_stage = {}
+    #     combined_query = {}
+    #     sort_criteria = {}
+
+    #     skip_count = int(params.pop("skip", 0))
+    #     limit_count = int(params.pop("pick", 0))
+
+    #     # --- Parse sort query ---
+    #     sort_param = params.pop("sort", None)
+    #     if sort_param:
+    #         for field in sort_param.split(","):
+    #             if field.startswith("-"):
+    #                 sort_criteria[field[1:]] = -1
+    #             else:
+    #                 sort_criteria[field] = 1
+
+    #     # --- Prepare filters & lookups ---
+    #     lookup_stages, base_filters, lookup_filters = (
+    #         self.extract_lookups_from_params(self.model, params, projection)
+    #     )
+
+    #     pipeline.extend(lookup_stages)
+
+    #     # --- Apply filters ---
+    #     if base_filters:
+    #         combined_query.update(self.query_builder(base_filters))
+    #     if lookup_filters:
+    #         combined_query.update(self.query_builder(lookup_filters))
+
+    #     if combined_query:
+    #         pipeline.append({"$match": combined_query})
+
+    #     # --- Sorting (before projection!) ---
+    #     if sort_criteria:
+    #         pipeline.append({"$sort": sort_criteria})
+
+    #     # --- Projection ---
+    #     if projection:
+    #         # Use provided projection
+    #         for item in projection:
+    #             if isinstance(item, str):
+    #                 projection_stage[item] = 1
+    #             elif isinstance(item, tuple):
+    #                 field_path, alias = item
+    #                 projection_stage[alias] = f"${field_path}"
+    #     else:
+    #         # Auto projection based on model fields
+    #         lookup_aliases = [
+    #             stage["$lookup"]["as"]
+    #             for stage in lookup_stages
+    #             if "$lookup" in stage
+    #         ]
+
+    #         for model_field, field in self.model.model_fields.items():
+    #             if hasattr(field, "model"):
+    #                 # Foreign key (looked up)
+    #                 if model_field in lookup_aliases:
+    #                     projection_stage[model_field] = f"${model_field}._id"
+    #                 else:
+    #                     projection_stage[model_field] = 1
+
+    #             elif hasattr(field.annotation, "model_fields"):
+    #                 # embedded field flattening
+    #                 projection_stage.update(
+    #                     {
+    #                         subfield: f"${model_field}.{subfield}"
+    #                         for subfield in field.annotation.model_fields
+    #                     }
+    #                 )
+
+    #             else:
+    #                 # Normal field
+    #                 projection_stage[model_field] = 1
+
+    #     # Final projection stage
+    #     if projection_stage:
+    #         pipeline.append({"$project": projection_stage})
+
+    #     # --- Pagination ---
+    #     if skip_count:
+    #         pipeline.append({"$skip": skip_count})
+    #     if limit_count:
+    #         pipeline.append({"$limit": limit_count})
+
+    #     # --- Execute ---
+    #     results = await self.collection.aggregate(
+    #         pipeline, allowDiskUse=True
+    #     ).to_list(length=None)
+    #     return [self.convert_to_serializable(doc) for doc in results]
+
+    '''This is working code for sinle layer of fk & embedded=================
     def extract_lookups_from_params(
         self,
         model,
         params: Dict[str, Any],
         projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
     ) -> tuple[list[dict], dict, dict]:
-
+        """
+        Returns:
+            lookup_stages: List of `$lookup` and `$unwind` stages
+            base_filters: Filters applied directly to root collection
+            lookup_filters: Filters applied to foreign collections via `$match`
+        """
         lookups = {}
         base_params = {}
         lookup_params = {}
@@ -93,64 +609,71 @@ class CommonDAO(AsyncDAOProtocol):
 
             model_field = model.model_fields.get(local_field)
             if model_field and not is_embedded_field(model_field):
-                meta = (model_field.json_schema_extra or {}).get("Meta", {})
-                ref_model = meta.get("ref_model")
-
-                if ref_model and hasattr(ref_model, "Meta") and hasattr(ref_model.Meta, "collection"):
-                    collection = getattr(ref_model.Meta.collection._collection, "name", None)
+                if hasattr(model_field, "model"):
+                    collection = (
+                        model_field.model.meta.collection._collection.name
+                    )
                     if collection:
                         lookups[local_field] = {
                             "from": collection,
                             "localField": local_field,
                             "foreignField": "_id",
-                            "as": local_field
+                            "as": local_field,
                         }
 
         # Separate filters into base model filters and foreign key (lookup) filters
         for param_key, param_value in params.items():
             if "." in param_key:
-                top_level_field, nested_path = param_key.split(".", 1)
-                model_field = model.model_fields.get(top_level_field)
+                top_field, nested_path = param_key.split(".", 1)
+                model_field = model.model_fields.get(top_field)
 
                 if model_field and is_embedded_field(model_field):
-                    # Directly add filters for embedded documents
                     base_params[param_key] = param_value
                 else:
-                    # Add lookup configuration if field is a foreign key
-                    add_lookup_for_field(top_level_field)
-
-                    if top_level_field in lookups:
-                        # Handle filters with operators (e.g., name__eq, board__sw)
+                    add_lookup_for_field(top_field)
+                    if top_field in lookups:
                         if "__" in nested_path:
-                            nested_field, operator = nested_path.split("__", 1)
-                            lookup_params[f"{top_level_field}.{nested_field}__{operator}"] = param_value
+                            nested_field, op = nested_path.split("__", 1)
+                            lookup_params[
+                                f"{top_field}.{nested_field}__{op}"
+                            ] = param_value
                         else:
-                            lookup_params[f"{top_level_field}.{nested_path}"] = param_value
+                            lookup_params[f"{top_field}.{nested_path}"] = (
+                                param_value
+                            )
                     else:
                         base_params[param_key] = param_value
             else:
-                # Handle flat field filters (e.g., "std__eq", "school_id__eq")
                 base_params[param_key] = param_value
 
-
-        # Extract lookup requirements from projection fields (used for foreign key joins)
+        # Extract lookup requirements from projection fields
         if projection:
             for projected_field in projection:
-                # If field has an alias (tuple), extract the actual field path
-                full_field_path = projected_field[0] if isinstance(projected_field, tuple) else projected_field
-
-                # Only handle nested paths (e.g., "school_id.name")
-                if "." in full_field_path:
-                    top_level_field, _ = full_field_path.split(".", 1)
-                    model_field = model.model_fields.get(top_level_field)
-
-                    # If it's not an embedded document, prepare a lookup
+                field_path = (
+                    projected_field[0]
+                    if isinstance(projected_field, tuple)
+                    else projected_field
+                )
+                if "." in field_path:
+                    top_field, _ = field_path.split(".", 1)
+                    model_field = model.model_fields.get(top_field)
                     if model_field and not is_embedded_field(model_field):
-                        add_lookup_for_field(top_level_field)
+                        add_lookup_for_field(top_field)
 
+        # Convert lookups to full `$lookup` + `$unwind` stages
+        lookup_stages = []
+        for local_field, lookup in lookups.items():
+            lookup_stages.append({"$lookup": lookup})
+            lookup_stages.append(
+                {
+                    "$unwind": {
+                        "path": f"${lookup['as']}",
+                        "preserveNullAndEmptyArrays": True,
+                    }
+                }
+            )
 
-        return list(lookups.values()), base_params, lookup_params
-
+        return lookup_stages, base_params, lookup_params
 
     async def search(
         self,
@@ -160,39 +683,39 @@ class CommonDAO(AsyncDAOProtocol):
         group_by_field: Optional[str] = None,
         unwind_fields: Optional[List[str]] = [],
     ) -> List[Dict[str, Any]]:
+        """
+        Sorting:
+        http://localhost:8000/api/stu/student?name__sw=R&sort=name,school_id.name
+        """
 
+        # --- Extract & parse pagination ---
         params = params or {}
-        skip_count = int(params.pop("skip", 0))
-        limit_count = int(params.pop("pick", 0))
-
-        lookups, base_filters, lookup_filters = self.extract_lookups_from_params(self.model, params, projection)
-
         pipeline = []
         processed_lookups = set()
         projection_stage = {}
-
-        def add_lookup_stage(lookup: Dict[str, Any]):
-            '''
-            Adds a $lookup and $unwind stage to the pipeline for a foreign key field if not already processed, 
-            enabling join and flattening of related documents.
-            '''
-            if lookup["as"] not in processed_lookups:
-                pipeline.append({"$lookup": lookup})
-                pipeline.append({
-                    "$unwind": {
-                        "path": f"${lookup['as']}",
-                        "preserveNullAndEmptyArrays": True
-                    }
-                })
-                processed_lookups.add(lookup["as"])
-
-       # Apply lookups before using combined filters
-        if lookups:
-            for lookup in lookups:
-                add_lookup_stage(lookup)
-
-        # Combine base and lookup filters into one $match stage
         combined_query = {}
+        sort_criteria = {}
+
+        skip_count = int(params.pop("skip", 0))
+        limit_count = int(params.pop("pick", 0))
+
+        # --- Parse sort query ---
+        sort_param = params.pop("sort", None)
+        if sort_param:
+            for field in sort_param.split(","):
+                if field.startswith("-"):
+                    sort_criteria[field[1:]] = -1
+                else:
+                    sort_criteria[field] = 1
+
+        # --- Prepare filters & lookups ---
+        lookup_stages, base_filters, lookup_filters = (
+            self.extract_lookups_from_params(self.model, params, projection)
+        )
+
+        pipeline.extend(lookup_stages)
+
+        # --- Apply filters ---
         if base_filters:
             combined_query.update(self.query_builder(base_filters))
         if lookup_filters:
@@ -201,868 +724,61 @@ class CommonDAO(AsyncDAOProtocol):
         if combined_query:
             pipeline.append({"$match": combined_query})
 
+        # --- Sorting (before projection!) ---
+        if sort_criteria:
+            pipeline.append({"$sort": sort_criteria})
+
+        # --- Projection ---
         if projection:
-            for proj_item in projection:
-                if isinstance(proj_item, str):
-                    projection_stage[proj_item] = 1
-                elif isinstance(proj_item, tuple):
-                    field_path, alias = proj_item
+            # Use provided projection
+            for item in projection:
+                if isinstance(item, str):
+                    projection_stage[item] = 1
+                elif isinstance(item, tuple):
+                    field_path, alias = item
                     projection_stage[alias] = f"${field_path}"
-
         else:
-            for field_name, field in self.model.model_fields.items():
-                meta = (field.json_schema_extra or {}).get("Meta", {})
-                related_model = meta.get("ref_model")
-                related_collection = meta.get("ref")
+            # Auto projection based on model fields
+            lookup_aliases = [
+                stage["$lookup"]["as"]
+                for stage in lookup_stages
+                if "$lookup" in stage
+            ]
 
-                if related_model and related_collection:
-                    if field_name in [lookup["as"] for lookup in lookups]:
-                        # If a $lookup was added (due to filtering), include only the FK _id field
-                        projection_stage[field_name] = f"${field_name}._id"
+            for model_field, field in self.model.model_fields.items():
+                if hasattr(field, "model"):
+                    # Foreign key (looked up)
+                    if model_field in lookup_aliases:
+                        projection_stage[model_field] = f"${model_field}._id"
                     else:
-                        # No lookup or projection needed, just include FK id field
-                        projection_stage[field_name] = 1
+                        projection_stage[model_field] = 1
 
                 elif hasattr(field.annotation, "model_fields"):
-                    projection_stage.update({
-                        subfield_name: f"${field_name}.{subfield_name}"
-                        for subfield_name in field.annotation.model_fields
-                    })
+                    # embedded field flattening
+                    projection_stage.update(
+                        {
+                            subfield: f"${model_field}.{subfield}"
+                            for subfield in field.annotation.model_fields
+                        }
+                    )
 
                 else:
-                    projection_stage[field_name] = 1
+                    # Normal field
+                    projection_stage[model_field] = 1
 
-
+        # Final projection stage
         if projection_stage:
             pipeline.append({"$project": projection_stage})
 
-        if sort_criteria:
-            pipeline.append({"$sort": sort_criteria})
+        # --- Pagination ---
         if skip_count:
             pipeline.append({"$skip": skip_count})
         if limit_count:
             pipeline.append({"$limit": limit_count})
 
-        results = await self.collection.aggregate(pipeline, allowDiskUse=True).to_list(length=None)
+        # --- Execute ---
+        results = await self.collection.aggregate(
+            pipeline, allowDiskUse=True
+        ).to_list(length=None)
         return [self.convert_to_serializable(doc) for doc in results]
-
-
-
-    ''' This is working code for all relation filters but not optimized====================
-
-    http://localhost:8000/api/stu/student?name__sw=John
-
-    http://localhost:8000/api/stu/student?school_id.name__sw=Greenwood
-
-    http://localhost:8000/api/stu/student?name__sw=John&school_id.name__sw=Greenwood
-
-    http://localhost:8000/api/stu/student?address.state__sw=Maha
-
-    projection=[
-            "name",
-            "std",
-            ("address.state", "state"),
-            ("address.pincode", "pincode"),
-            ("school_id.name", "school_name"),
-            ("school_id.board", "school_board"),
-        ]
-
-
-
-    def convert_to_serializable(self, doc: dict) -> dict:
-        def convert(value):
-            if isinstance(value, ObjectId):
-                return str(value)
-            elif isinstance(value, dict):
-                return {k: convert(v) for k, v in value.items()}
-            elif isinstance(value, list):
-                return [convert(v) for v in value]
-            return value
-
-        return convert(doc)
-    
-    def extract_lookups_from_params(self, model, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-        lookups = {}
-        base_params = {}
-        lookup_params = {}
-
-        for key, value in params.items():
-            if "." in key:
-                local_field, rest = key.split(".", 1)
-                
-                # Skip lookups if this is an embedded field
-                model_field = model.model_fields.get(local_field)
-                if model_field and model_field.annotation.__name__ == "EmbeddedDocument":
-                    base_params[key] = value
-                    continue
-
-                collection = self.get_lookup_collection(model, local_field)
-                if collection:
-                    if local_field not in lookups:
-                        lookups[local_field] = {
-                            "from": collection,
-                            "localField": local_field,
-                            "foreignField": "_id",
-                            "as": local_field
-                        }
-                    lookup_params[f"{local_field}.{rest}"] = value
-                else:
-                    base_params[key] = value
-
-        return list(lookups.values()), base_params, lookup_params
-
-
-    def query_builder(self, filters: Dict[str, Any]) -> Dict[str, Any]:
-        query = {}
-        for key, value in filters.items():
-            if "__" in key:
-                field, op = key.split("__", 1)
-                if op == "eq":
-                    query[field] = value
-                elif op == "ne":
-                    query[field] = {"$ne": value}
-                elif op == "lt":
-                    query[field] = {"$lt": value}
-                elif op == "lte":
-                    query[field] = {"$lte": value}
-                elif op == "gt":
-                    query[field] = {"$gt": value}
-                elif op == "gte":
-                    query[field] = {"$gte": value}
-                elif op == "in":
-                    query[field] = {"$in": value if isinstance(value, list) else [value]}
-                elif op == "contain":
-                    query[field] = {"$regex": value, "$options": "i"}
-                elif op == "sw":  # starts with
-                    query[field] = {"$regex": f"^{value}", "$options": "i"}
-                elif op == "ew":  # ends with
-                    query[field] = {"$regex": f"{value}$", "$options": "i"}
-            else:
-                query[key] = value
-        return query
-
-
-    def get_lookup_collection(self, model, field_name: str) -> Optional[str]:
-        field_info = model.model_fields.get(field_name)
-        if not field_info or not field_info.json_schema_extra:
-            return None
-
-        meta = field_info.json_schema_extra.get("Meta", {})
-        ref = meta.get("ref")
-
-        if ref:
-            return f"{ref}"
-        return None
-    
-    def get_lookup_model(self, model, field_name: str):
-        field_info = model.model_fields.get(field_name)
-        if not field_info or not field_info.json_schema_extra:
-            return None
-
-        meta = field_info.json_schema_extra.get("Meta", {})
-        return meta.get("ref_model")
-    
-    async def search(
-        self,
-        params: Dict[str, Any] = {},
-        projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
-        sort: Optional[Dict[str, int]] = None,
-        group_by: Optional[str] = None,
-        unwind_fields: Optional[List[str]] = [],
-    ) -> List[Dict[str, Any]]:
-        params = params or {}
-        skip = int(params.pop("skip", 0))
-        pick = int(params.pop("pick", 0))
-
-        lookups, base_params, lookup_params = self.extract_lookups_from_params(self.model, params)
-        base_query = self.query_builder(base_params)
-        lookup_query = self.query_builder(lookup_params)
-
-        pipeline = []
-        existing_lookups = set()
-
-        def add_lookup_stage(lookup):
-            pipeline.append({"$lookup": lookup})
-            pipeline.append({
-                "$unwind": {
-                    "path": f"${lookup['as']}",
-                    "preserveNullAndEmptyArrays": True
-                }
-            })
-
-        if base_query:
-            pipeline.append({"$match": base_query})
-
-        for lookup in lookups:
-            if lookup["as"] not in existing_lookups:
-                add_lookup_stage(lookup)
-                existing_lookups.add(lookup["as"])
-
-        if lookup_query:
-            pipeline.append({"$match": lookup_query})
-
-        project_stage = {}
-
-        # Custom projections (user-defined)
-        if projection:
-            for field in projection:
-                if isinstance(field, str):
-                    project_stage[field] = 1
-                elif isinstance(field, tuple):
-                    path, alias = field
-                    parts = path.split(".")
-                    if len(parts) != 2:
-                        continue
-
-                    local_field, foreign_field = parts
-
-                    # Check if it's a foreign key (needs $lookup)
-                    if local_field not in existing_lookups:
-                        related_collection = self.get_lookup_collection(self.model, local_field)
-
-                        if related_collection:
-                            add_lookup_stage({
-                                "from": related_collection,
-                                "localField": local_field,
-                                "foreignField": "_id",
-                                "as": local_field,
-                            })
-                            existing_lookups.add(local_field)
-
-                    # Whether embedded or lookup, just project directly
-                    project_stage[alias] = f"${path}"
-
-        # Default projection (if none specified)
-        else:
-            for field_name, field in self.model.model_fields.items():
-                meta = (field.json_schema_extra or {}).get("Meta", {})
-                related_model = meta.get("ref_model")
-                related_collection = meta.get("ref")
-
-                # For foreign key fields (with $lookup)
-                if related_model and related_collection:
-                    if field_name not in existing_lookups:
-                        add_lookup_stage({
-                            "from": related_collection,
-                            "localField": field_name,
-                            "foreignField": "_id",
-                            "as": field_name,
-                        })
-                        existing_lookups.add(field_name)
-
-                    for related_field in related_model.model_fields:
-                        if related_field == "id":
-                            continue
-                        alias = f"{field_name.replace('_id', '')}_{related_field}"
-                        project_stage[alias] = f"${field_name}.{related_field}"
-
-                # For embedded models (flatten fields like 'address.state' => 'state')
-                elif hasattr(field.annotation, "model_fields"):
-                    for embedded_field in field.annotation.model_fields:
-                        alias = embedded_field  # e.g., 'state'
-                        project_stage[alias] = f"${field_name}.{embedded_field}"
-
-                else:
-                    project_stage[field_name] = 1
-
-        if project_stage:
-            pipeline.append({"$project": project_stage})
-        if sort:
-            pipeline.append({"$sort": sort})
-        if skip:
-            pipeline.append({"$skip": skip})
-        if pick:
-            pipeline.append({"$limit": pick})
-
-        results = await self.collection.aggregate(pipeline).to_list(length=None)
-        return [self.convert_to_serializable(doc) for doc in results]
-
     '''
-    
-    # ======================OK===========FK + projection
-
-    # async def search(
-    #     self,
-    #     params: Dict[str, Any] = {},
-    #     projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
-    #     sort: Optional[Dict[str, int]] = None,
-    #     group_by: Optional[str] = None,
-    #     unwind_fields: Optional[List[str]] = [],
-    # ) -> List[Dict[str, Any]]:
-    #     params = params or {}
-    #     skip = int(params.pop("skip", 0))
-    #     pick = int(params.pop("pick", 0))
-
-    #     lookups, base_params, lookup_params = self.extract_lookups_from_params(self.model, params)
-    #     base_query = self.query_builder(base_params)
-    #     lookup_query = self.query_builder(lookup_params)
-
-    #     pipeline = []
-    #     existing_lookups = set()
-
-    #     def add_lookup_stage(lookup):
-    #         pipeline.append({"$lookup": lookup})
-    #         pipeline.append({
-    #             "$unwind": {
-    #                 "path": f"${lookup['as']}",
-    #                 "preserveNullAndEmptyArrays": True
-    #             }
-    #         })
-
-    #     if base_query:
-    #         pipeline.append({"$match": base_query})
-
-    #     for lookup in lookups:
-    #         if lookup["as"] not in existing_lookups:
-    #             add_lookup_stage(lookup)
-    #             existing_lookups.add(lookup["as"])
-
-    #     if lookup_query:
-    #         pipeline.append({"$match": lookup_query})
-
-    #     project_stage = {}
-
-    #     # Custom projections (user-defined)
-    #     if projection:
-    #         for field in projection:
-    #             if isinstance(field, str):
-    #                 project_stage[field] = 1
-    #             elif isinstance(field, tuple):
-    #                 path, alias = field
-    #                 parts = path.split(".")
-    #                 if len(parts) != 2:
-    #                     continue
-
-    #                 local_field, foreign_field = parts
-    #                 if local_field not in existing_lookups:
-    #                     related_collection = self.get_lookup_collection(self.model, local_field)
-    #                     if not related_collection:
-    #                         continue
-
-    #                     add_lookup_stage({
-    #                         "from": related_collection,
-    #                         "localField": local_field,
-    #                         "foreignField": "_id",
-    #                         "as": local_field,
-    #                     })
-    #                     existing_lookups.add(local_field)
-
-    #                 project_stage[alias] = f"${local_field}.{foreign_field}"
-
-    #     # Default projection (if none specified)
-    #     else:
-    #         for field_name, field in self.model.model_fields.items():
-    #             meta = (field.json_schema_extra or {}).get("Meta", {})
-    #             related_model = meta.get("ref_model")
-    #             related_collection = meta.get("ref")
-
-    #             if related_model and related_collection:
-    #                 if field_name not in existing_lookups:
-    #                     add_lookup_stage({
-    #                         "from": related_collection,
-    #                         "localField": field_name,
-    #                         "foreignField": "_id",
-    #                         "as": field_name,
-    #                     })
-    #                     existing_lookups.add(field_name)
-
-    #                 # Flatten joined fields
-    #                 for related_field in related_model.model_fields:
-    #                     if related_field == "id":
-    #                         continue
-    #                     alias = f"{field_name.replace('_id', '')}_{related_field}"
-    #                     project_stage[alias] = f"${field_name}.{related_field}"
-    #             else:
-    #                 project_stage[field_name] = 1
-
-    #     if project_stage:
-    #         pipeline.append({"$project": project_stage})
-    #     if sort:
-    #         pipeline.append({"$sort": sort})
-    #     if skip:
-    #         pipeline.append({"$skip": skip})
-    #     if pick:
-    #         pipeline.append({"$limit": pick})
-
-    #     results = await self.collection.aggregate(pipeline).to_list(length=None)
-    #     return [self.convert_to_serializable(doc) for doc in results]
-
-
-    ####################NEW updated with fk projection & q-parms===============
-
-
-    # async def search(
-    #     self,
-    #     params: Dict[str, Any] = None,
-    #     projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
-    #     sort: Optional[Dict[str, int]] = None,
-    # ) -> List[Dict[str, Any]]:
-        # skip = int(params.pop("skip", 0))
-        # pick = int(params.pop("pick", 0))
-    #     lookups, base_params, lookup_params = self.extract_lookups_from_params(self.model, params or {})
-    #     base_query = self.query_builder(base_params)
-    #     lookup_query = self.query_builder(lookup_params)
-
-    #     pipeline = []
-
-    #     def add_lookup_stage(pipeline, lookup):
-    #         pipeline.append({"$lookup": lookup})
-    #         pipeline.append({
-    #             "$unwind": {
-    #                 "path": f"${lookup['as']}",
-    #                 "preserveNullAndEmptyArrays": True
-    #             }
-    #         })
-
-    #     if base_query:
-    #         pipeline.append({"$match": base_query})
-
-    #     existing_lookups = set()
-    #     for lookup in lookups:
-    #         if lookup["as"] not in existing_lookups:
-    #             add_lookup_stage(pipeline, lookup)
-    #             existing_lookups.add(lookup["as"])
-
-    #     if lookup_query:
-    #         pipeline.append({"$match": lookup_query})
-
-    #     project_stage = {}
-    #     if projection:
-    #         for field in projection:
-    #             if isinstance(field, str):
-    #                 project_stage[field] = 1
-    #             elif isinstance(field, tuple):
-    #                 path, alias = field
-    #                 parts = path.split(".")
-    #                 if len(parts) != 2:
-    #                     continue
-
-    #                 local_field, foreign_field = parts
-    #                 if local_field not in existing_lookups:
-    #                     related_collection = self.get_lookup_collection(self.model, local_field)
-    #                     if not related_collection:
-    #                         continue
-
-    #                     lookup = {
-    #                         "from": related_collection,
-    #                         "localField": local_field,
-    #                         "foreignField": "_id",
-    #                         "as": local_field,
-    #                     }
-    #                     add_lookup_stage(pipeline, lookup)
-    #                     existing_lookups.add(local_field)
-
-    #                 project_stage[alias] = f"${local_field}.{foreign_field}"
-
-    #     if project_stage:
-    #         pipeline.append({"$project": project_stage})
-
-    #     if sort:
-    #         pipeline.append({"$sort": sort})
-    #     if skip:
-    #         pipeline.append({"$skip": skip})
-    #     if pick:
-    #         pipeline.append({"$limit": pick})
-
-    #     results = await self.collection.aggregate(pipeline).to_list(length=None)
-    #     return [self.convert_to_serializable(doc) for doc in results]
-
-    # #######################################################################
-
-
-    # def extract_lookups_from_params(self, model, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    #     lookups = {}
-    #     rewritten_params = {}
-
-    #     for key, value in params.items():
-    #         if "." in key:
-    #             local_field, rest = key.split(".", 1)
-    #             collection = self.get_lookup_collection(model, local_field)
-    #             if collection:
-    #                 if local_field not in lookups:
-    #                     lookups[local_field] = {
-    #                         "from": collection,
-    #                         "localField": local_field,
-    #                         "foreignField": "_id",
-    #                         "as": local_field
-    #                     }
-    #                 rewritten_params[f"{local_field}.{rest}"] = value
-    #             else:
-    #                 rewritten_params[key] = value
-    #         else:
-    #             rewritten_params[key] = value
-
-    #     return list(lookups.values()), rewritten_params
-    
-    # def extract_lookups_from_params(self, model, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-    #     lookups = {}
-    #     base_params = {}
-    #     lookup_params = {}
-
-    #     for key, value in params.items():
-    #         if "." in key:
-    #             local_field, rest = key.split(".", 1)
-    #             collection = self.get_lookup_collection(model, local_field)
-    #             if collection:
-    #                 if local_field not in lookups:
-    #                     lookups[local_field] = {
-    #                         "from": collection,
-    #                         "localField": local_field,
-    #                         "foreignField": "_id",
-    #                         "as": local_field
-    #                     }
-    #                 lookup_params[f"{local_field}.{rest}"] = value
-    #             else:
-    #                 base_params[key] = value
-    #         else:
-    #             base_params[key] = value
-
-    #     return list(lookups.values()), base_params, lookup_params
-
-
-    # def query_builder(self, filters: Dict[str, Any]) -> Dict[str, Any]:
-    #     query = {}
-    #     for key, value in filters.items():
-    #         if "__" in key:
-    #             field, op = key.split("__", 1)
-    #             if op == "eq":
-    #                 query[field] = value
-    #             elif op == "ne":
-    #                 query[field] = {"$ne": value}
-    #             elif op == "lt":
-    #                 query[field] = {"$lt": value}
-    #             elif op == "lte":
-    #                 query[field] = {"$lte": value}
-    #             elif op == "gt":
-    #                 query[field] = {"$gt": value}
-    #             elif op == "gte":
-    #                 query[field] = {"$gte": value}
-    #             elif op == "in":
-    #                 query[field] = {"$in": value if isinstance(value, list) else [value]}
-    #             elif op == "contain":
-    #                 query[field] = {"$regex": value, "$options": "i"}
-    #             elif op == "sw":  # starts with
-    #                 query[field] = {"$regex": f"^{value}", "$options": "i"}
-    #             elif op == "ew":  # ends with
-    #                 query[field] = {"$regex": f"{value}$", "$options": "i"}
-    #         else:
-    #             query[key] = value
-    #     return query
-
-    # ============================ok for fk projection==============================
-    
-    # async def search(
-    #     self,
-    #     params: Dict[str, Any] = None,
-    #     projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
-    #     sort: Optional[Dict[str, int]] = None,
-    # ) -> List[Dict[str, Any]]:
-    #     query = self.build_query(params)
-    #     pipeline = [{"$match": query}]
-    #     project_stage = {}
-    #     lookups = {}
-
-    #     if projection:
-    #         for field in projection:
-    #             if isinstance(field, str):
-    #                 project_stage[field] = 1
-    #             elif isinstance(field, tuple):
-    #                 path, alias = field
-    #                 parts = path.split(".")
-    #                 if len(parts) != 2:
-    #                     continue
-
-    #                 local_field, foreign_field = parts
-
-    #                 related_collection = self.get_lookup_collection(self.model, local_field)
-    #                 if not related_collection:
-    #                     continue
-
-    #                 if local_field not in lookups:
-    #                     lookups[local_field] = {
-    #                         "from": related_collection,
-    #                         "localField": local_field,
-    #                         "foreignField": "_id",
-    #                         "as": local_field,
-    #                     }
-
-    #                 project_stage[alias] = f"${local_field}.{foreign_field}"
-
-    #     # Add all lookups first
-    #     for lookup in lookups.values():
-    #         pipeline.append({"$lookup": lookup})
-    #         # Flatten single document array
-    #         pipeline.append({"$unwind": f"${lookup['as']}"})
-
-    #     if project_stage:
-    #         pipeline.append({"$project": project_stage})
-
-    #     if sort:
-    #         pipeline.append({"$sort": sort})
-
-    #     results = await self.collection.aggregate(pipeline).to_list(length=None)
-    #     results = [self.convert_to_serializable(doc) for doc in results]
-    #     return results
-
-
-    # def convert_to_serializable(self, doc: dict) -> dict:
-    #     def convert(value):
-    #         if isinstance(value, ObjectId):
-    #             return str(value)
-    #         elif isinstance(value, dict):
-    #             return {k: convert(v) for k, v in value.items()}
-    #         elif isinstance(value, list):
-    #             return [convert(v) for v in value]
-    #         return value
-
-    #     return convert(doc)
-
-    # def get_lookup_collection(self, model, field_name: str) -> Optional[str]:
-    #     field_info = model.model_fields.get(field_name)
-    #     if not field_info or not field_info.json_schema_extra:
-    #         return None
-
-    #     # Extract from nested "Meta" dictionary
-    #     meta = field_info.json_schema_extra.get("Meta", {})
-    #     ref = meta.get("ref")
-
-    #     if ref:
-    #         return f"{ref}"
-    #     return None
-    
-    # ==============================end ok projection========================================
-    
-
-    # async def get_all(self) -> List[Dict[str, Any]]:
-    #     results = await self.qs().all()
-    #     return [self.convert_to_serializable(doc.dict()) for doc in results]
-    
-    # async def get(self, *args, **filters):
-    #     if args:
-    #         raise TypeError("CommonDAO.get() only accepts keyword arguments.")
-        
-    #     query = self.query_builder(filters)
-    #     result = await self.qs().filter(**query).first()
-
-    #     if result:
-    #         return self.convert_to_serializable(result.dict())
-    #     return None
-
-    # async def count(self, **filters) -> int:
-    #     query = self.query_builder(filters)
-    #     return await self.qs().filter(**query).count()
-
-    # async def filter(self, **filters) -> List[Dict[str, Any]]:
-    #     query = self.query_builder(filters)
-    #     results = await self.qs().filter(**query).all()
-    #     return [doc.dict() for doc in results]
-
-    # async def update(self, filter_params: Dict[str, Any], update_data: Dict[str, Any]) -> int:
-    #     query = self.query_builder(filter_params)
-    #     return await self.qs().filter(**query).update({"$set": update_data})
-
-    # async def delete(self, **filters) -> int:
-    #     query = self.query_builder(filters)
-    #     return await self.qs().filter(**query).delete()
-
-    # async def create(self, data: Dict[str, Any]) -> Dict[str, Any]:
-    #     obj = await self.qs().create(**data)
-    #     return obj.dict()
-    
-    # def query_builder(self, params: Dict[str, Any]) -> Dict[str, Any]:
-    #     query = {}
-    #     operator_map = {
-    #         "eq": "$eq", "ne": "$ne", "nq": "$ne",
-    #         "gt": "$gt", "lt": "$lt", "gte": "$gte", "lte": "$lte",
-    #         "in": "$in", "nin": "$nin", "between": "$gte",
-    #         "ieq": "$regex", "sw": "$regex", "bw": "$regex", "contains": "$regex"
-    #     }
-
-    #     for key, value in params.items():
-    #         if key in {"id", "_id"}:
-    #             try:
-    #                 value = ObjectId(value)
-    #                 key = "_id"
-    #             except Exception:
-    #                 pass
-
-    #         if "__" in key:
-    #             field, op = key.rsplit("__", 1)
-    #             mongo_op = operator_map.get(op)
-
-    #             if op == "between" and isinstance(value, list) and len(value) == 2:
-    #                 query[field] = {"$gte": value[0], "$lte": value[1]}
-    #             elif op == "ieq":
-    #                 query[field] = {mongo_op: f"^{re.escape(value)}$", "$options": "i"}
-    #             elif op == "sw":
-    #                 query[field] = {mongo_op: f"^{re.escape(value)}", "$options": "i"}
-    #             elif op == "bw":
-    #                 query[field] = {mongo_op: f"{re.escape(value)}$", "$options": "i"}
-    #             elif op == "contains":
-    #                 query[field] = {mongo_op: re.escape(value), "$options": "i"}
-    #             elif mongo_op:
-    #                 query[field] = {mongo_op: value}
-    #             else:
-    #                 query[field] = value
-    #         else:
-    #             query[key] = value
-
-    #     return query
-
-
-
-# def get_foreign_model(field: str, model: type[BaseDocument]):
-    #     annotations = get_type_hints(model)
-    #     if field in annotations:
-    #         ann = annotations[field]
-    #         if getattr(ann, '__origin__', None) is Annotated:
-    #             return get_args(ann)[0]
-    #     return None
-
-
-    # def build_query(params: Dict[str, Any]) -> Dict[str, Any]:
-    #     query = {}
-    #     for k, v in params.items():
-    #         if "__" in k:
-    #             field, op = k.split("__", 1)
-    #             if op == "eq":
-    #                 query[field] = v
-    #             elif op == "contain":
-    #                 query[field] = {"$regex": v, "$options": "i"}
-    #             elif op == "in":
-    #                 query[field] = {"$in": v}
-    #         else:
-    #             query[k] = v
-    #     return query
-
-
-    # async def search(
-    #     self,
-    #     params: Dict[str, Any],
-    #     projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
-    #     sort: Optional[Dict[str, int]] = None,
-    # ) -> List[Dict[str, Any]]:
-    #     query = self.build_query(params)
-    #     pipeline = [{"$match": query}]
-
-    #     lookups = []
-    #     final_projection = {}
-
-    #     if projection:
-    #         for item in projection:
-    #             if isinstance(item, str):
-    #                 final_projection[item] = 1
-    #             elif isinstance(item, tuple):
-    #                 nested_field, alias = item
-    #                 parent_field, child_field = nested_field.split(".", 1)
-
-    #                 fk_model = self.get_foreign_model(parent_field, self.model)
-    #                 if fk_model:
-    #                     collection_name = getattr(fk_model, '__collection_name__', fk_model.__name__.lower() + "s")
-    #                     lookup_stage = {
-    #                         "$lookup": {
-    #                             "from": collection_name,
-    #                             "localField": parent_field,
-    #                             "foreignField": "_id",
-    #                             "as": f"{parent_field}_info",
-    #                         }
-    #                     }
-    #                     if lookup_stage not in lookups:
-    #                         lookups.append(lookup_stage)
-    #                         lookups.append({"$unwind": f"${parent_field}_info"})
-
-    #                     final_projection[alias] = f"${parent_field}_info.{child_field}"
-
-    #     pipeline.extend(lookups)
-
-    #     if final_projection:
-    #         pipeline.append({"$project": final_projection})
-
-    #     if sort:
-    #         pipeline.append({"$sort": sort})
-
-    #     results = await self.collection.aggregate(pipeline).to_list(length=None)
-    #     return results
-
-    
-    # async def search(
-    #     self,
-    #     params: Dict[str, Any],
-    #     sort: Optional[Dict[str, int]] = None,
-    #     group_by: Optional[str] = None,
-    #     unwind_fields: Optional[List[str]] = [],
-    #     projection: Optional[List[str]] = [],
-    # ) -> List[Dict[str, Any]]:
-    #     query = self.query_builder(params)
-    #     pipeline = [{"$match": query}]
-
-    #     if unwind_fields:
-    #         for field in unwind_fields:
-    #             if field.endswith("_id"):
-    #                 related_collection = field[:-3] + "s"
-    #             else:
-    #                 related_collection = field + "s"
-
-    #             pipeline.append({
-    #                 "$lookup": {
-    #                     "from": related_collection,
-    #                     "localField": field,
-    #                     "foreignField": "_id",
-    #                     "as": f"{field}_info"
-    #                 }
-    #             })
-
-    #             pipeline.append({"$unwind": f"${field}_info"})
-
-    #     if projection:
-    #         proj = {field: 1 for field in projection}
-    #         pipeline.append({"$project": proj})
-
-    #     if group_by:
-    #         pipeline.append({
-    #             "$group": {
-    #                 "_id": f"${group_by}",
-    #                 "items": {"$push": "$$ROOT"}
-    #             }
-    #         })
-
-    #     if sort:
-    #         pipeline.append({"$sort": sort})
-
-    #     results = await self.collection.aggregate(pipeline).to_list(length=None)
-
-    #     return [convert_to_serializable(doc) for doc in results]
-
-
-    # async def search(
-    #     self,
-    #     params: Dict[str, Any],
-    #     sort: Optional[Dict[str, int]] = None,
-    #     group_by: Optional[str] = None,
-    #     unwind_fields: Optional[List[str]] = [],
-    #     projection: Optional[List[str]] = [],
-    # ) -> List[Dict[str, Any]]:
-    #     query = self.query_builder(params)
-    #     pipeline = [{"$match": query}]
-
-    #     for field in unwind_fields:
-    #         pipeline.append({"$unwind": f"${field}"})
-
-    #     if group_by:
-    #         pipeline.append({
-    #             "$group": {
-    #                 "_id": f"${group_by}",
-    #                 "items": {"$push": "$$ROOT"}
-    #             }
-    #         })
-
-    #     if sort:
-    #         pipeline.append({"$sort": sort})
-
-    #     if projection:
-    #         proj = {field: 1 for field in projection}
-    #         pipeline.append({"$project": proj})
-
-    #     # collection = self.get_collection()
-    #     results = await self.collection.aggregate(pipeline).to_list(length=None)
-    #     return [convert_to_serializable(doc) for doc in results]

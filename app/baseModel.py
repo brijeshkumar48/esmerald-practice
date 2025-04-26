@@ -3,10 +3,13 @@ from typing import Union, ClassVar
 from bson import ObjectId
 from mongoz import Document
 
+
 class MethodNotDefined(Exception):
     """Raised when a required method is not defined in a subclass."""
+
     def __init__(self, detail: str):
         super().__init__(detail)
+
 
 class BaseDocument(Document):
     """
@@ -16,7 +19,9 @@ class BaseDocument(Document):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Check if the child class has the 'get_dbtype' method
-        if not hasattr(self, "get_dbtype") or not callable(getattr(self, "get_dbtype", None)):
+        if not hasattr(self, "get_dbtype") or not callable(
+            getattr(self, "get_dbtype", None)
+        ):
             raise MethodNotDefined(
                 detail=f"Method get_dbtype is not defined in class {self.__class__.__name__}"
             )
@@ -27,7 +32,9 @@ class BaseDocument(Document):
         Return the ObjectId by formatting and verifying the input ID.
         """
         if isinstance(id, str):
-            m = re.search(r'ObjectId\([\'"]([a-fA-F0-9]{24})[\'"]\)', id.strip())
+            m = re.search(
+                r'ObjectId\([\'"]([a-fA-F0-9]{24})[\'"]\)', id.strip()
+            )
             if m:
                 object_id_value = m.group(1)
                 return ObjectId(object_id_value)

@@ -1,7 +1,13 @@
 # urls.py
 from esmerald.routing.router import Gateway, Include
 
-from app.views import create_student, delete_file, insert_student, stu_details, upload_file
+from app.views import (
+    create_student,
+    delete_file,
+    insert_student,
+    stu_details,
+    upload_file,
+)
 
 urlpatterns = [
     Gateway("/api/file", handler=upload_file),
