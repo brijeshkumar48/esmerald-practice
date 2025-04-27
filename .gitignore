@@ -15,7 +15,7 @@ env/
 .pytest_cache/
 
 # Ignore IDE/editor files
-.vscode/
+# .vscode/
 .idea/
 
 # Ignore log files
