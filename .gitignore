@@ -1,0 +1,22 @@
+# Ignore Python bytecode files
+*.pyc
+*.pyo
+__pycache__/
+
+# Ignore virtual environment directories
+myenv/
+venv/
+env/
+
+# Ignore .env file used for environment variables
+.env
+
+# Ignore pytest cache
+.pytest_cache/
+
+# Ignore IDE/editor files
+.vscode/
+.idea/
+
+# Ignore log files
+*.log

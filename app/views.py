@@ -3,9 +3,23 @@ from typing import Any, Dict, Optional
 from bson import ObjectId
 from esmerald import Form, Query, Response, get, post, delete, Request, status
 from app.commonDao import CommonDAO
+from app.llm_service import call_llm
 from app.models.app_models import Address, School, Student, UploadedMediaFile
 from app.models.stuDao import StudentDAO
 from app.utils import generate_response
+
+
+@post("/generate")
+async def llm_response(
+    system_prompt: str, user_message: str, request: Request, **kwargs: Any
+) -> Response:
+    output = await call_llm(system_prompt, user_message)
+    return generate_response(
+        request=request,
+        data={"response": output},
+        message="Ok",
+    )
+
 
 UPLOAD_DIR = "media/uploads/files"
 
