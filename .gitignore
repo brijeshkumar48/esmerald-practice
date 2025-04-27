@@ -4,6 +4,7 @@
 __pycache__/
 
 # Ignore virtual environment directories
+media/
 myenv/
 venv/
 env/
@@ -15,7 +16,7 @@ env/
 .pytest_cache/
 
 # Ignore IDE/editor files
-# .vscode/
+.vscode/
 .idea/
 
 # Ignore log files

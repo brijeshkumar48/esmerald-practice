@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    container_name: esmerald_app
+    ports:
+      - "4892:4892"
+    environment:
+      - MONGO_URI=mongodb://root:root@mongodb:27017
+      - MONGO_DB=test_database
+    volumes:
+      - ./media/uploads/files/:/var/lib/brijesh/media
+    restart: unless-stopped
+
+  mongodb:
+    image: mongodb/mongodb-community-server
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=root
+      - MONGO_INITDB_ROOT_PASSWORD=root
+    volumes:
+      - mongo_db_data:/mongodb_data/db
+
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: nginx
+  #   ports:
+  #     - "8080:80"
+  #   volumes:
+  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+  #     - ./media:/var/lib/brijesh/media
+  #   restart: unless-stopped
+
+volumes:
+  mongo_db_data:
+    driver: local
