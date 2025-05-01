@@ -70,10 +70,6 @@ class University(BaseDocument):
         database = "test_database"
         collection = "universities"
 
-    # @staticmethod
-    # def get_collection_name():
-    #     return "universities"
-
 
 SchoolBoardChoices = (
     ("ST", "State Board"),
@@ -92,13 +88,19 @@ class School(BaseDocument):
         database = "test_database"
         collection = "schools"
 
-    # @staticmethod
-    # def get_collection_name():
-    #     return "schools"
+
+class Zone(BaseDocument):
+    zone_name: str = mongoz.String()
+
+    class Meta:
+        registry = registry
+        database = "test_database"
+        collection = "zone"
 
 
 class Continent(BaseDocument):
     continent_name: str = mongoz.String()
+    zone_id: ObjectId = ForeignKey(Zone)
 
     class Meta:
         registry = registry
@@ -115,10 +117,6 @@ class Country(BaseDocument):
         database = "test_database"
         collection = "countries"
 
-    # @staticmethod
-    # def get_collection_name():
-    #     return "countries"
-
 
 class Address(mongoz.EmbeddedDocument):
     village: str = mongoz.String()
@@ -131,22 +129,15 @@ class Address(mongoz.EmbeddedDocument):
         database = "test_database"
         collection = "address"
 
-    # @staticmethod
-    # def get_collection_name():
-    #     return "address"
-
 
 class Student(BaseDocument):
     name: str = mongoz.String()
     std: str = mongoz.String()
     school_id: ObjectId = ForeignKey(School)
-    address: Address = mongoz.EmbeddedDocument()
+    # address: Address = mongoz.EmbeddedDocument()
+    address: List[Address] = mongoz.Array(Address, default=[])
 
     class Meta:
         registry = registry
         database = "test_database"
         collection = "students"
-
-    # @staticmethod
-    # def get_collection_name():
-    #     return "students"

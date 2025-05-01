@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 from typing import Any, Dict, Optional
 from bson import ObjectId
@@ -125,30 +126,82 @@ async def stu_details(
 
     stu = await student_dao.search(
         params=q,
+        unwind_fields=[
+            "address",
+            "address.country_id",
+            "address.country_id.continent_id",
+        ],
+        group_by_field="_id",
         projection=[
             "name",
             "std",
+            ("address.village", "village"),
             ("address.state", "state"),
             ("address.pincode", "pincode"),
             ("address.country_id.country_name", "country_name"),
-            ("address.country_id._id", "country_id"),
             (
                 "address.country_id.continent_id.continent_name",
                 "continent_name",
             ),
+            (
+                "address.country_id.continent_id.zone_id.zone_name",
+                "zone_name",
+            ),
             ("school_id.name", "school_name"),
-            ("school_id.board", "school_board"),
-            ("school_id._id", "school_id"),
             ("school_id.university_id.un_name", "university_name"),
-            ("school_id.university_id._id", "university_id"),
         ],
     )
+
+    # formatted_data = transform_search_results(stu)
 
     return generate_response(
         request=request,
         data=stu,
         message="Ok",
     )
+
+
+def transform_search_results(stu: list[dict]) -> list[dict]:
+    grouped = defaultdict(
+        lambda: {
+            "_id": None,
+            "name": None,
+            "std": None,
+            "school_name": None,
+            "university_name": None,
+            "addresses": [],
+        }
+    )
+
+    for record in stu:
+        student_id = record.get("_id")
+        group = grouped[student_id]
+
+        # Set top-level values once
+        if group["_id"] is None:
+            group["_id"] = student_id
+            group["name"] = record.get("name")
+            group["std"] = record.get("std")
+            group["school_name"] = record.get("school_name")
+            group["university_name"] = record.get("university_name")
+
+        # Address-related info
+        address = {}
+        for key in [
+            "village",
+            "state",
+            "pincode",
+            "country_name",
+            "continent_name",
+        ]:
+            if key in record:
+                address[key] = record[key]
+
+        # Only append non-empty addresses
+        if address and address not in group["addresses"]:
+            group["addresses"].append(address)
+
+    return list(grouped.values())
 
 
 @post("/create_stu")

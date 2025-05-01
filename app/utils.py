@@ -1,6 +1,6 @@
 import logging
 from starlette.background import BackgroundTask, BackgroundTasks
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Union
 from esmerald.conf import settings
 import json
 from esmerald import Response, Request
