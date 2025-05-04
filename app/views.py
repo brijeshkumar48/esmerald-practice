@@ -126,11 +126,13 @@ async def stu_details(
 
     stu = await student_dao.search(
         params=q,
-        unwind_fields=[
-            "address",
-            "address.country_id",
-            "address.country_id.continent_id",
-        ],
+        # unwind_fields=[
+        #     "address",
+        #     "address.country_id",
+        #     "address.country_id.continent_id",
+        #     "school_id.university_id.body",
+        #     "school_id.university_id.body.body_name",
+        # ],
         group_by_field="_id",
         projection=[
             "name",
@@ -143,13 +145,15 @@ async def stu_details(
                 "address.country_id.continent_id.continent_name",
                 "continent_name",
             ),
-            (
-                "address.country_id.continent_id.zone_id.zone_name",
-                "zone_name",
-            ),
             ("school_id.name", "school_name"),
             ("school_id.university_id.un_name", "university_name"),
+            ("school_id.university_id.body.body_name", "body_name"),
+            (
+                "school_id.university_id.body.country_id.country_name",
+                "body_country_name",
+            ),
         ],
+        # additional_value={"school_id.name": "ttttttttttttttttt"},
     )
 
     # formatted_data = transform_search_results(stu)

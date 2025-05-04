@@ -107,22 +107,17 @@ class CommonDAO(AsyncDAOProtocol):
         model,
         params: Dict[str, Any],
         projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
-    ) -> tuple[list[dict], dict, dict]:
+    ) -> tuple[list[dict], dict, dict, set]:
         """
         Optimized dynamic deep lookup extractor with proper unwind handling.
         - Dynamically builds MongoDB $lookup and $unwind stages for nested relations.
         - Separates parameters into base fields and lookup fields.
         """
-
-        # Return early if both params and projection are empty
         if not params and not projection:
             return [], {}, {}, set()
 
-        # Stores lookup definitions for nested references
         lookups = {}
-        # Stores params that don't require lookup (base model fields)
         base_params = {}
-        # Stores params that require lookup (related model fields)
         lookup_params = {}
         unwind_paths = set()
 
@@ -173,7 +168,6 @@ class CommonDAO(AsyncDAOProtocol):
                             "localField": full_path,
                             "foreignField": "_id",
                             "as": full_path,
-                            "pipeline": [],
                         }
                     current_model = model_field.model
                     current_path = full_path
@@ -185,12 +179,9 @@ class CommonDAO(AsyncDAOProtocol):
                     else:
                         current_model = ann
                     current_path = full_path
-                    unwind_paths.add(
-                        full_path
-                    )  # ensure embedded path is unwound
+                    unwind_paths.add(full_path)
 
                 else:
-                    # scalar field inside embedded doc – unwind its parent
                     parent_path = ".".join(parts[:index])
                     if parent_path:
                         unwind_paths.add(parent_path)
@@ -215,19 +206,18 @@ class CommonDAO(AsyncDAOProtocol):
                 )
                 if "." in field_path:
                     add_lookup_chain(field_path)
-
-                    # embedded parent for unwind even if no lookup
                     parts = field_path.split(".")
                     for i in range(1, len(parts)):
                         parent_path = ".".join(parts[:i])
                         unwind_paths.add(parent_path)
 
-        # --- Init lookup stages early ---
+        # --- Init lookup stages safely ---
         lookup_stages = []
+        added_unwinds = set()
 
-        # unwind stages for embedded (non-lookup) paths
-        for path in unwind_paths:
-            if path not in lookups:
+        # Unwind embedded paths (non-lookup)
+        for path in sorted(unwind_paths):
+            if path not in lookups and path not in added_unwinds:
                 lookup_stages.append(
                     {
                         "$unwind": {
@@ -236,8 +226,9 @@ class CommonDAO(AsyncDAOProtocol):
                         }
                     }
                 )
+                added_unwinds.add(path)
 
-        # --- Build lookup stages ---
+        # Build lookup and unwind stages
         for full_path, lookup in lookups.items():
             lookup_stages.append(
                 {
@@ -249,14 +240,16 @@ class CommonDAO(AsyncDAOProtocol):
                     }
                 }
             )
-            lookup_stages.append(
-                {
-                    "$unwind": {
-                        "path": f"${lookup['as']}",
-                        "preserveNullAndEmptyArrays": True,
+            if full_path not in added_unwinds:
+                lookup_stages.append(
+                    {
+                        "$unwind": {
+                            "path": f"${full_path}",
+                            "preserveNullAndEmptyArrays": True,
+                        }
                     }
-                }
-            )
+                )
+                added_unwinds.add(full_path)
 
         test = (lookup_stages, base_params, lookup_params, unwind_paths)
 
@@ -269,6 +262,7 @@ class CommonDAO(AsyncDAOProtocol):
         sort: Optional[Dict[str, int]] = None,
         group_by_field: Optional[str] = None,
         unwind_fields: Optional[List[str]] = [],
+        additional_value: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Highly optimized search using smarter lookup generation and unwind handling.
@@ -391,6 +385,10 @@ class CommonDAO(AsyncDAOProtocol):
                 safe_field = field.replace(".", "_")
                 projection_stage[safe_field] = f"${field}"
 
+        # Apply base paths to the projection if needed
+        if additional_value:
+            self.add_extra_value_to_pipeline(additional_value, pipeline)
+
         # Add projection stage to pipeline
         if projection_stage:
             pipeline.append({"$project": projection_stage})
@@ -433,6 +431,30 @@ class CommonDAO(AsyncDAOProtocol):
         ).to_list(length=None)
 
         return [self.convert_to_serializable(doc) for doc in results]
+
+    def add_extra_value_to_pipeline(
+        self, additional_value: Dict[str, str], pipeline: List[Dict[str, Any]]
+    ):
+        pipeline.extend(
+            [
+                {
+                    "$addFields": {
+                        field_name: {
+                            "$concat": [
+                                base_path,
+                                (
+                                    f"${'.'.join(field_parts[:-1])}.{field_parts[-1]}"
+                                    if "." in field_name
+                                    else f"${field_name}"
+                                ),
+                            ]
+                        }
+                    }
+                }
+                for field_name, base_path in additional_value.items()
+                for field_parts in [field_name.split(".")]
+            ]
+        )
 
     # ===========================EMBEDDED ARRAY HARD CODED============WORKING CODE=========
 

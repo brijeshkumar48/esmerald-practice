@@ -3,6 +3,7 @@ from typing import Annotated, Any, ClassVar, List, Optional, Type, Union
 import mongoz
 from pydantic import Field
 from app.baseModel import BaseDocument
+from app.models.model_resolver import get_zone_model
 from db.registry import registry
 from bson import ObjectId
 from mongoz import Document, EmbeddedDocument
@@ -62,8 +63,39 @@ class UploadedMediaFile(BaseDocument):
         return "uploaded_media_file"
 
 
+class Continent(BaseDocument):
+    continent_name: str = mongoz.String()
+    zone_id: ObjectId = ForeignKey(lambda: Zone)
+
+    class Meta:
+        registry = registry
+        database = "test_database"
+        collection = "continents"
+
+
+class Country(BaseDocument):
+    country_name: str = mongoz.String()
+    continent_id: ObjectId = ForeignKey(Continent)
+
+    class Meta:
+        registry = registry
+        database = "test_database"
+        collection = "countries"
+
+
+class Bodies(EmbeddedDocument):
+    body_name: str = mongoz.String()
+    country_id: ObjectId = ForeignKey(Country)
+
+    class Meta:
+        registry = registry
+        database = "test_database"
+        collection = "bodies"
+
+
 class University(BaseDocument):
     un_name: str = mongoz.String()
+    body: List[Bodies] = mongoz.Array(Bodies, default=[])
 
     class Meta:
         registry = registry
@@ -89,36 +121,7 @@ class School(BaseDocument):
         collection = "schools"
 
 
-class Zone(BaseDocument):
-    zone_name: str = mongoz.String()
-
-    class Meta:
-        registry = registry
-        database = "test_database"
-        collection = "zone"
-
-
-class Continent(BaseDocument):
-    continent_name: str = mongoz.String()
-    zone_id: ObjectId = ForeignKey(Zone)
-
-    class Meta:
-        registry = registry
-        database = "test_database"
-        collection = "continents"
-
-
-class Country(BaseDocument):
-    country_name: str = mongoz.String()
-    continent_id: ObjectId = ForeignKey(Continent)
-
-    class Meta:
-        registry = registry
-        database = "test_database"
-        collection = "countries"
-
-
-class Address(mongoz.EmbeddedDocument):
+class Address(EmbeddedDocument):
     village: str = mongoz.String()
     state: str = mongoz.String()
     pincode: str = mongoz.Integer()
@@ -141,3 +144,12 @@ class Student(BaseDocument):
         registry = registry
         database = "test_database"
         collection = "students"
+
+
+class Zone(BaseDocument):
+    zone_name: str = mongoz.String()
+
+    class Meta:
+        registry = registry
+        database = "test_database"
+        collection = "zone"
