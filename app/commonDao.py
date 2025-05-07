@@ -1,4 +1,6 @@
+import ast
 from collections import defaultdict
+import datetime
 from pprint import pformat
 from typing import (
     Any,
@@ -12,7 +14,7 @@ from typing import (
     Annotated,
     get_args,
 )
-
+from datetime import datetime
 from pydantic import Field
 from app.baseModel import BaseDocument
 from bson import ObjectId
@@ -55,51 +57,154 @@ class CommonDAO(AsyncDAOProtocol):
 
         return convert(doc)
 
+    def _auto_cast(self, val: Any) -> Any:
+        """
+        Attempt to convert the value to a datetime object.
+        If parsing fails, return the original value.
+        """
+        if not isinstance(val, str):
+            return val
+
+        # Try ISO format
+        try:
+            return datetime.fromisoformat(val)
+        except ValueError:
+            pass
+
+        # Try common date formats
+        date_formats = [
+            "%Y-%m-%d",
+            "%d-%m-%Y",
+            "%d/%m/%Y",
+            "%m/%d/%Y",
+            "%Y/%m/%d",
+            "%Y-%m-%d %H:%M:%S",
+            "%d-%m-%Y %H:%M:%S",
+            "%m/%d/%Y %H:%M:%S",
+        ]
+
+        for fmt in date_formats:
+            try:
+                return datetime.strptime(val, fmt)
+            except ValueError:
+                continue
+
+        # Not a datetime, return as-is
+        return val
+
+    def _parse_values(self, field: str, value: Any) -> Any:
+        # Handle ObjectId
+        if isinstance(value, str):
+            try:
+                return ObjectId(value)
+            except Exception:
+                pass
+
+        # Try to safely evaluate values (e.g., convert "10" to int)
+        try:
+            return ast.literal_eval(value)
+        except Exception:
+            return value  # return raw string if evaluation fails
+
+    def _parse_str_to_list(self, value: Any) -> list:
+        if isinstance(value, list):
+            return value
+
+        if isinstance(value, str):
+            try:
+                if value.startswith("[") and value.endswith("]"):
+                    parsed = ast.literal_eval(value)
+                    if isinstance(parsed, list):
+                        return parsed
+            except Exception:
+                pass
+            return [v.strip() for v in value.strip("[]").split(",")]
+
+        raise ValueError("Invalid list format for 'in' or 'between' operator")
+
     def query_builder(self, filters: Dict[str, Any]) -> Dict[str, Any]:
         query = {}
-        for key, value in filters.items():
-            if "__" in key:
-                field, op = key.split("__", 1)
-                if "." in field:
-                    field_parts = field.split(".")
-                    query_field = f"{'.'.join(field_parts)}"
-                else:
-                    # Handle flat fields
-                    query_field = field
+        OPERATORS = {
+            "eq": "$eq",
+            "ne": "$ne",
+            "gt": "$gt",
+            "gte": "$gte",
+            "lt": "$lt",
+            "lte": "$lte",
+            "in": "$in",
+            "nin": "$nin",
+            "regex": "$regex",
+            "ieq": "ieq",
+            "be": "between",
+            "sw": "sw",
+            "ew": "ew",
+        }
 
-                if op == "eq":
-                    query[query_field] = value  # Corrected here
-                elif op == "ne":
-                    query[query_field] = {"$ne": value}  # Corrected here
-                elif op == "lt":
-                    query[query_field] = {"$lt": value}  # Corrected here
-                elif op == "lte":
-                    query[query_field] = {"$lte": value}  # Corrected here
-                elif op == "gt":
-                    query[query_field] = {"$gt": value}  # Corrected here
-                elif op == "gte":
-                    query[query_field] = {"$gte": value}  # Corrected here
-                elif op == "in":
-                    query[query_field] = {
-                        "$in": value if isinstance(value, list) else [value]
-                    }  # Corrected here
-                elif op == "contain":
-                    query[query_field] = {
-                        "$regex": value,
-                        "$options": "i",
-                    }  # Corrected here
-                elif op == "sw":
-                    query[query_field] = {
-                        "$regex": f"^{value}",
-                        "$options": "i",
-                    }  # Corrected here
-                elif op == "ew":
-                    query[query_field] = {
-                        "$regex": f"{value}$",
-                        "$options": "i",
-                    }  # Corrected here
+        for key, value in filters.items():
+            field = key
+            operator = "eq"
+
+            for op in OPERATORS:
+                if key.endswith(f"__{op}"):
+                    operator = op
+                    field = key.rsplit(f"__{op}", 1)[0]
+                    break
+
+            if operator not in OPERATORS:
+                raise ValueError(f"Unsupported operator: {operator}")
+
+            mongo_op = OPERATORS[operator]
+
+            if operator == "in":
+                value = self._parse_str_to_list(value)
+                parsed_values = [
+                    self._parse_values(field, val) for val in value
+                ]
+                query[field] = {mongo_op: parsed_values}
+
+            elif operator == "be":
+                value = self._parse_str_to_list(value)
+                if isinstance(value, list) and len(value) == 2:
+                    try:
+                        value = [self._auto_cast(v) for v in value]
+                        query[field] = {"$gte": value[0], "$lte": value[1]}
+                    except Exception as e:
+                        raise ValueError(
+                            f"Failed to parse 'between' values: {value}"
+                        ) from e
+                else:
+                    raise ValueError(
+                        f"'between' operator requires exactly two values for field '{field}'"
+                    )
+
+            elif operator == "ieq":
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"'ieq' operator requires a string for field '{field}'"
+                    )
+                query[field] = {"$regex": f"^{value}$", "$options": "i"}
+
+            elif operator == "sw":
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"'sw' operator requires a string for field '{field}'"
+                    )
+                query[field] = {"$regex": f"^{value}", "$options": "i"}
+
+            elif operator == "ew":
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"'ew' operator requires a string for field '{field}'"
+                    )
+                query[field] = {"$regex": f"{value}$", "$options": "i"}
+
+            elif operator == "eq":
+                query[field] = self._parse_values(field, value)
+
             else:
-                query[key] = value
+                parsed_value = self._parse_values(field, value)
+                query[field] = {mongo_op: parsed_value}
+
         return query
 
     def _extract_lookups_from_params(
