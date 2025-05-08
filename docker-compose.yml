@@ -10,7 +10,7 @@ services:
       - MONGO_URI=mongodb://root:root@mongodb:27017
       - MONGO_DB=test_database
     volumes:
-      - ./media/uploads/files/:/var/lib/brijesh/media
+      - ./media/uploaded-files:/var/lib/playmity/media
     restart: unless-stopped
 
   mongodb:
@@ -24,16 +24,16 @@ services:
     volumes:
       - mongo_db_data:/mongodb_data/db
 
-  # nginx:
-  #   image: nginx:alpine
-  #   container_name: nginx
-  #   ports:
-  #     - "8080:80"
-  #   volumes:
-  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-  #     - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-  #     - ./media:/var/lib/brijesh/media
-  #   restart: unless-stopped
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./media/uploaded-files:/var/lib/playmity/media
+    restart: unless-stopped
 
 volumes:
   mongo_db_data:
