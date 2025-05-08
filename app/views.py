@@ -10,6 +10,31 @@ from app.models.stuDao import StudentDAO
 from app.utils import generate_response
 
 
+# This is where files are stored in Nginx
+MEDIA_PATH = "/var/lib/playmity/media"
+
+
+@get()
+async def protected_file(request: Request, file_path: str) -> Response:
+    print("file_path =======>", file_path)
+
+    full_path = f"{MEDIA_PATH}/{file_path}"
+
+    # Optional: enforce extension check manually
+    if not file_path.lower().endswith((".jpg", ".png", ".pdf", ".txt")):
+        return Response(content="Invalid file type", status_code=400)
+
+    if not os.path.exists(full_path):
+        return Response(content="File not found", status_code=404)
+
+    return generate_response(
+        request=request,
+        extra_headers={"X-Accel-Redirect": f"/privateFile/{file_path}"},
+        data={},
+        message="Ok",
+    )
+
+
 @post("/generate")
 async def llm_response(
     system_prompt: str, user_message: str, request: Request, **kwargs: Any
@@ -22,7 +47,7 @@ async def llm_response(
     )
 
 
-UPLOAD_DIR = "media/uploads/files"
+UPLOAD_DIR = "media/uploaded-files"
 
 
 @post("/upload-file")
@@ -133,7 +158,7 @@ async def stu_details(
         #     "school_id.university_id.body",
         #     "school_id.university_id.body.body_name",
         # ],
-        group_by_field="_id",
+        group_by_field="name",
         projection=[
             "name",
             "std",
@@ -208,6 +233,120 @@ def transform_search_results(stu: list[dict]) -> list[dict]:
     return list(grouped.values())
 
 
+# ==============ISSUE==not working proper ==missed country_name in aggregation response===============
+"""
+pipeline = [
+    {"$unwind": {"path": "$school_id", "preserveNullAndEmptyArrays": True}},
+    {
+        "$unwind": {
+            "path": "$school_id.university_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body.country_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "school_id",
+            "foreignField": "_id",
+            "from": "schools",
+            "localField": "school_id",
+        }
+    },
+    {"$unwind": {"path": "$school_id", "preserveNullAndEmptyArrays": True}},
+    {
+        "$lookup": {
+            "as": "school_id.university_id",
+            "foreignField": "_id",
+            "from": "universities",
+            "localField": "school_id.university_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "school_id.university_id.body.country_id",
+            "foreignField": "_id",
+            "from": "countries",
+            "localField": "school_id.university_id.body.country_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body.country_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$project": {
+            "body_country_name": "$school_id.university_id.body.country_id.country_name",
+            "body_name": "$school_id.university_id.body.body_name",
+            "name": "$name",
+        }
+    },
+]
+
+
+# final pipeline correct
+[
+    {
+        "$lookup": {
+            "from": "schools",
+            "localField": "school_id",
+            "foreignField": "_id",
+            "as": "school",
+        }
+    },
+    {"$unwind": {"path": "$school", "preserveNullAndEmptyArrays": True}},
+    {
+        "$lookup": {
+            "from": "universities",
+            "localField": "school.university_id",
+            "foreignField": "_id",
+            "as": "university",
+        }
+    },
+    {"$unwind": {"path": "$university", "preserveNullAndEmptyArrays": True}},
+    {
+        "$unwind": {
+            "path": "$university.body",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "from": "countries",
+            "localField": "university.body.country_id",
+            "foreignField": "_id",
+            "as": "country",
+        }
+    },
+    {"$unwind": {"path": "$country", "preserveNullAndEmptyArrays": True}},
+]
+"""
+
+
 @post("/create_stu")
 async def insert_student(request: Request, **kwargs: Any) -> Response:
     student_data = {
@@ -224,3 +363,221 @@ async def insert_student(request: Request, **kwargs: Any) -> Response:
         data={},
         message="Ok",
     )
+
+
+[
+    {"$unwind": {"path": "$address", "preserveNullAndEmptyArrays": True}},
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "address.country_id",
+            "foreignField": "_id",
+            "from": "countries",
+            "localField": "address.country_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$address.country_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "address.country_id.continent_id",
+            "foreignField": "_id",
+            "from": "continents",
+            "localField": "address.country_id.continent_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$address.country_id.continent_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "school_id",
+            "foreignField": "_id",
+            "from": "schools",
+            "localField": "school_id",
+        }
+    },
+    {"$unwind": {"path": "$school_id", "preserveNullAndEmptyArrays": True}},
+    {
+        "$lookup": {
+            "as": "school_id.university_id",
+            "foreignField": "_id",
+            "from": "universities",
+            "localField": "school_id.university_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "school_id.university_id.body.country_id",
+            "foreignField": "_id",
+            "from": "countries",
+            "localField": "school_id.university_id.body.country_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body.country_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$project": {
+            "body_country_name": "$school_id.university_id.body.country_id.country_name",
+            "body_name": "$school_id.university_id.body.body_name",
+            "continent_name": "$address.country_id.continent_id.continent_name",
+            "country_name": "$address.country_id.country_name",
+            "name": "$name",
+            "pincode": "$address.pincode",
+            "school_name": "$school_id.name",
+            "state": "$address.state",
+            "std": "$std",
+            "university_name": "$school_id.university_id.un_name",
+            "village": "$address.village",
+        }
+    },
+]
+# ===========================================
+
+
+[
+    {"$unwind": {"path": "$address", "preserveNullAndEmptyArrays": True}},
+    {
+        "$unwind": {
+            "path": "$address.country_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$address.country_id.continent_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body.country_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id_university_id.body",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "address_country_id",
+            "foreignField": "_id",
+            "from": "countries",
+            "localField": "address.country_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$address_country_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "address_country_id_continent_id",
+            "foreignField": "_id",
+            "from": "continents",
+            "localField": "address_country_id.continent_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$address_country_id_continent_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "school_id",
+            "foreignField": "_id",
+            "from": "schools",
+            "localField": "school_id",
+        }
+    },
+    {"$unwind": {"path": "$school_id", "preserveNullAndEmptyArrays": True}},
+    {
+        "$lookup": {
+            "as": "school_id_university_id",
+            "foreignField": "_id",
+            "from": "universities",
+            "localField": "school_id.university_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id_university_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "school_id_university_id_body_country_id",
+            "foreignField": "_id",
+            "from": "countries",
+            "localField": "school_id_university_id.body.country_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id_university_id_body_country_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$project": {
+            "address_country_id": "$address_country_id",
+            "address_country_id_continent_id": "$address_country_id_continent_id",
+            "body_country_name": "$school_id.university_id.body.country_id.country_name",
+            "body_name": "$school_id.university_id.body.body_name",
+            "continent_name": "$address.country_id.continent_id.continent_name",
+            "country_name": "$address.country_id.country_name",
+            "name": "$name",
+            "pincode": "$address.pincode",
+            "school_id": "$school_id",
+            "school_id_university_id": "$school_id_university_id",
+            "school_id_university_id_body_country_id": "$school_id_university_id_body_country_id",
+            "school_name": "$school_id.name",
+            "state": "$address.state",
+            "std": "$std",
+            "university_name": "$school_id.university_id.un_name",
+            "village": "$address.village",
+        }
+    },
+]

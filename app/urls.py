@@ -4,8 +4,8 @@ from esmerald.routing.router import Gateway, Include
 from app.views import (
     create_student,
     delete_file,
-    insert_student,
     llm_response,
+    protected_file,
     stu_details,
     upload_file,
 )
@@ -14,7 +14,94 @@ urlpatterns = [
     Gateway("/api/file", handler=upload_file),
     Gateway("/api/file/delete-file/", handler=delete_file),
     Gateway("/api/stu", handler=stu_details),
-    Gateway("/api/stu", handler=insert_student),
+    # Gateway("/api/stu", handler=insert_student),
     Gateway("/api/stu", handler=create_student),
     Gateway("/api/llm", handler=llm_response),
+    Gateway(path="/api/media/{file_path:path}", handler=protected_file),
+]
+
+
+# =============in correct===================
+[
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "school_id",
+            "foreignField": "_id",
+            "from": "schools",
+            "localField": "school_id",
+        }
+    },
+    {"$unwind": {"path": "$school_id", "preserveNullAndEmptyArrays": True}},
+    {
+        "$lookup": {
+            "as": "school_id.university_id",
+            "foreignField": "_id",
+            "from": "universities",
+            "localField": "school_id.university_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "as": "school_id.university_id.body.country_id",
+            "foreignField": "_id",
+            "from": "countries",
+            "localField": "school_id.university_id.body.country_id",
+        }
+    },
+    {
+        "$unwind": {
+            "path": "$school_id.university_id.body.country_id",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+]
+
+
+# =============correct ==================
+[
+    {
+        "$lookup": {
+            "from": "schools",
+            "localField": "school_id",
+            "foreignField": "_id",
+            "as": "school",
+        }
+    },
+    {"$unwind": {"path": "$school", "preserveNullAndEmptyArrays": True}},
+    {
+        "$lookup": {
+            "from": "universities",
+            "localField": "school.university_id",
+            "foreignField": "_id",
+            "as": "university",
+        }
+    },
+    {"$unwind": {"path": "$university", "preserveNullAndEmptyArrays": True}},
+    {
+        "$unwind": {
+            "path": "$university.body",
+            "preserveNullAndEmptyArrays": True,
+        }
+    },
+    {
+        "$lookup": {
+            "from": "countries",
+            "localField": "university.body.country_id",
+            "foreignField": "_id",
+            "as": "country",
+        }
+    },
+    {"$unwind": {"path": "$country", "preserveNullAndEmptyArrays": True}},
 ]
