@@ -42,3 +42,39 @@ def generate_response(
         return Response(
             content={"message": f"Internal Server Error:{e}"}, status_code=500
         )
+
+
+from functools import wraps
+from esmerald import Response
+import re
+
+
+def validate_uploaded_files_path():
+    """
+    Decorator to validate that the file_path starts with 'uploaded-files/'
+    and contains only allowed characters.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Extract file_path from kwargs (depends on your handler signature)
+            file_path = kwargs.get("file_path")
+
+            # Validate the path
+            if not re.fullmatch(
+                r"^uploaded-files/[a-zA-Z0-9_\-\/.]*$", file_path
+            ):
+                return Response(
+                    {
+                        "detail": "Invalid path. Must follow 'uploaded-files/{filename}'."
+                    },
+                    status_code=400,
+                )
+
+            # Proceed if validation passes
+            return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator

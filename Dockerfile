@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose the port that the app will run on
-EXPOSE 4892
+EXPOSE 8000
 
 # Command to run the application using uvicorn (production-ready)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "4892"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

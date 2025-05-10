@@ -1,5 +1,7 @@
 from collections import defaultdict
 import os
+import re
+from pathlib import Path
 from typing import Any, Dict, Optional
 from bson import ObjectId
 from esmerald import Form, Query, Response, get, post, delete, Request, status
@@ -7,20 +9,23 @@ from app.commonDao import CommonDAO
 from app.llm_service import call_llm
 from app.models.app_models import Address, School, Student, UploadedMediaFile
 from app.models.stuDao import StudentDAO
-from app.utils import generate_response
+from app.utils import generate_response, validate_uploaded_files_path
 
 
 # This is where files are stored in Nginx
-MEDIA_PATH = "/var/lib/playmity/media"
+# MEDIA_PATH = "/var/lib/playmity/media/"
+MEDIA_PATH = "/media"
 
 
 @get()
+@validate_uploaded_files_path()
 async def protected_file(request: Request, file_path: str) -> Response:
     print("file_path =======>", file_path)
 
-    full_path = f"{MEDIA_PATH}/{file_path}"
+    full_path = os.path.join(MEDIA_PATH, file_path)
+    print("full_path =======>", full_path)
 
-    # Optional: enforce extension check manually
+    # Optional: Validate allowed extensions
     if not file_path.lower().endswith((".jpg", ".png", ".pdf", ".txt")):
         return Response(content="Invalid file type", status_code=400)
 
@@ -35,21 +40,6 @@ async def protected_file(request: Request, file_path: str) -> Response:
     )
 
 
-@post("/generate")
-async def llm_response(
-    system_prompt: str, user_message: str, request: Request, **kwargs: Any
-) -> Response:
-    output = await call_llm(system_prompt, user_message)
-    return generate_response(
-        request=request,
-        data={"response": output},
-        message="Ok",
-    )
-
-
-UPLOAD_DIR = "media/uploaded-files"
-
-
 @post("/upload-file")
 async def upload_file(
     logger: Any,
@@ -61,14 +51,22 @@ async def upload_file(
     uploaded_file = data.get("path")
     file_type = data.get("type")
 
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    # Absolute path where file will be saved inside the container
+    # ABSOLUTE_UPLOAD_DIR = "/media/uploaded-files"
 
-    # Save file
-    file_path = os.path.join(UPLOAD_DIR, uploaded_file.filename)
-    with open(file_path, "wb") as buffer:
+    UPLOAD_DIR = os.getenv("UPLOAD_DIR", "media/uploaded-files")
+    ABSOLUTE_UPLOAD_DIR = Path(UPLOAD_DIR)
+    ABSOLUTE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Full file system path to save the file
+    full_path = os.path.join(ABSOLUTE_UPLOAD_DIR, uploaded_file.filename)
+    with open(full_path, "wb") as buffer:
         buffer.write(await uploaded_file.read())
 
-    relative_path = os.path.normpath(file_path).replace(os.sep, "/")
+    # Relative path to be stored in DB (used in download)
+    relative_path = os.path.normpath(
+        os.path.join("media/uploaded-files", uploaded_file.filename)
+    ).replace(os.sep, "/")
 
     data = {
         "path": relative_path,
@@ -76,11 +74,23 @@ async def upload_file(
         "name": str(uploaded_file.filename),
     }
 
-    upload_instance = await UploadedMediaFile.objects.create(**data)
+    await UploadedMediaFile.objects.create(**data)
 
     return generate_response(
         request=request,
         data=data,
+        message="Ok",
+    )
+
+
+@post("/generate")
+async def llm_response(
+    system_prompt: str, user_message: str, request: Request, **kwargs: Any
+) -> Response:
+    output = await call_llm(system_prompt, user_message)
+    return generate_response(
+        request=request,
+        data={"response": output},
         message="Ok",
     )
 

@@ -11,13 +11,16 @@ from app.views import (
 )
 
 urlpatterns = [
+    Gateway(
+        path="/api/media/{file_path:path}",
+        handler=protected_file,
+    ),
     Gateway("/api/file", handler=upload_file),
     Gateway("/api/file/delete-file/", handler=delete_file),
     Gateway("/api/stu", handler=stu_details),
     # Gateway("/api/stu", handler=insert_student),
     Gateway("/api/stu", handler=create_student),
     Gateway("/api/llm", handler=llm_response),
-    Gateway(path="/api/media/{file_path:path}", handler=protected_file),
 ]
 
 

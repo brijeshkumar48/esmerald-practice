@@ -5,12 +5,36 @@ services:
     build: .
     container_name: esmerald_app
     ports:
-      - "4892:4892"
+      - "8000:8000"
     environment:
       - MONGO_URI=mongodb://root:root@mongodb:27017
       - MONGO_DB=test_database
+      - UPLOAD_DIR=/media/uploaded-files
+      # - UPLOAD_DIR=/app/media/uploaded-files
+      # - UPLOAD_DIR=/var/lib/playmity/media/uploaded-files
     volumes:
-      - ./media/uploaded-files:/var/lib/playmity/media
+      # - ./media/uploaded-files:/media/uploaded-files
+      # - ./media/uploaded-files:/var/lib/playmity/media/uploaded-files
+      # - ./media/uploaded-files:/media/uploaded-files  # working this 1
+      - ./media/uploaded-files:/media/uploaded-files # Esmerald sees files here
+
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      # - ./media/uploaded-files:/var/lib/playmity/media/uploaded-files
+      # - ./media/uploaded-files:/var/lib/playmity/media/uploaded-files
+      # - ./media/uploaded-files:/var/lib/playmity/media/
+      # - ./media/uploaded-files:/media/uploaded-files    #working this 1
+      - ./media/uploaded-files:/var/lib/playmity/media/uploaded-files # Nginx sees files here
+    depends_on:
+      - app
     restart: unless-stopped
 
   mongodb:
@@ -23,17 +47,6 @@ services:
       - MONGO_INITDB_ROOT_PASSWORD=root
     volumes:
       - mongo_db_data:/mongodb_data/db
-
-  nginx:
-    image: nginx:alpine
-    container_name: nginx
-    ports:
-      - "8080:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./media/uploaded-files:/var/lib/playmity/media
-    restart: unless-stopped
 
 volumes:
   mongo_db_data:
