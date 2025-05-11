@@ -15,6 +15,7 @@ from typing import (
     get_args,
 )
 from datetime import datetime
+from mongoz import EmbeddedDocument
 from pydantic import Field
 from app.baseModel import BaseDocument
 from bson import ObjectId
@@ -360,7 +361,287 @@ class CommonDAO(AsyncDAOProtocol):
 
         return lookup_stages, base_params, lookup_params, unwind_paths
 
+    def _extract_lookups_from_params0(
+        self,
+        model,
+        params: Dict[str, Any],
+        projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
+    ) -> tuple[list[dict], dict, dict, set]:
+        """
+        Optimized dynamic deep lookup extractor with proper unwind handling.
+        - Dynamically builds MongoDB $lookup and $unwind stages for nested relations.
+        - Separates parameters into base fields and lookup fields.
+        """
+        if not params and not projection:
+            return [], {}, {}, set()
+
+        lookups = {}
+        base_params = {}
+        lookup_params = {}
+        unwind_paths = set()
+
+        def is_embedded_field(model_field) -> bool:
+            ann = getattr(model_field, "annotation", None)
+            if get_origin(ann) is Union:
+                args = get_args(ann)
+                non_none_args = [arg for arg in args if arg is not type(None)]
+                if len(non_none_args) == 1:
+                    ann = non_none_args[0]
+            if get_origin(ann) is list:
+                inner = get_args(ann)[0]
+                return hasattr(inner, "model_fields")
+            return hasattr(ann, "model_fields")
+
+        def add_lookup_chain(field_path: str):
+            parts = field_path.split(".")
+            current_model = model
+            current_path = ""
+
+            for index, part in enumerate(parts):
+                origin = get_origin(current_model)
+                if origin is Union:
+                    args = get_args(current_model)
+                    non_none_args = [
+                        arg for arg in args if arg is not type(None)
+                    ]
+                    if len(non_none_args) == 1:
+                        current_model = non_none_args[0]
+                        origin = get_origin(current_model)
+                if origin is list:
+                    current_model = get_args(current_model)[0]
+
+                model_fields = getattr(current_model, "model_fields", {})
+                model_field = model_fields.get(part)
+                if not model_field:
+                    break
+
+                full_path = f"{current_path}.{part}" if current_path else part
+
+                if hasattr(model_field, "model"):  # ForeignKey relation
+                    if full_path not in lookups:
+                        collection = (
+                            model_field.model.meta.collection._collection.name
+                        )
+                        lookups[full_path] = {
+                            "from": collection,
+                            "localField": full_path,
+                            "foreignField": "_id",
+                            "as": full_path,
+                        }
+                    current_model = model_field.model
+                    current_path = full_path
+
+                elif is_embedded_field(model_field):
+                    ann = getattr(model_field, "annotation", None)
+                    if get_origin(ann) is list:
+                        current_model = get_args(ann)[0]
+                    else:
+                        current_model = ann
+                    current_path = full_path
+                    unwind_paths.add(full_path)
+
+                else:
+                    parent_path = ".".join(parts[:index])
+                    if parent_path:
+                        unwind_paths.add(parent_path)
+                    break
+
+        # --- Parse and classify params ---
+        for param_key, param_value in params.items():
+            base_field_path = param_key.split("__")[0]
+            if "." in base_field_path:
+                add_lookup_chain(base_field_path)
+                lookup_params[param_key] = param_value
+            else:
+                base_params[param_key] = param_value
+
+        # --- Parse projections for additional lookups ---
+        if projection:
+            for projected_field in projection:
+                field_path = (
+                    projected_field[0]
+                    if isinstance(projected_field, tuple)
+                    else projected_field
+                )
+                if "." in field_path:
+                    add_lookup_chain(field_path)
+                    parts = field_path.split(".")
+                    for i in range(1, len(parts)):
+                        parent_path = ".".join(parts[:i])
+                        unwind_paths.add(parent_path)
+
+        # --- Init lookup stages safely ---
+        lookup_stages = []
+        added_unwinds = set()
+
+        # Unwind embedded paths (non-lookup)
+        for path in sorted(unwind_paths):
+            if path not in lookups and path not in added_unwinds:
+                lookup_stages.append(
+                    {
+                        "$unwind": {
+                            "path": f"${path}",
+                            "preserveNullAndEmptyArrays": True,
+                        }
+                    }
+                )
+                added_unwinds.add(path)
+
+        # Build lookup and unwind stages
+        for full_path, lookup in lookups.items():
+            lookup_stages.append(
+                {
+                    "$lookup": {
+                        "from": lookup["from"],
+                        "localField": lookup["localField"],
+                        "foreignField": lookup["foreignField"],
+                        "as": lookup["as"],
+                    }
+                }
+            )
+            if full_path not in added_unwinds:
+                lookup_stages.append(
+                    {
+                        "$unwind": {
+                            "path": f"${full_path}",
+                            "preserveNullAndEmptyArrays": True,
+                        }
+                    }
+                )
+                added_unwinds.add(full_path)
+
+        test = (lookup_stages, base_params, lookup_params, unwind_paths)
+
+        return lookup_stages, base_params, lookup_params, unwind_paths
+
     async def search(
+        self,
+        params: Dict[str, Any] = {},
+        projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
+        sort: Optional[Dict[str, int]] = None,
+        group_by_field: Optional[str] = None,
+        unwind_fields: Optional[List[str]] = [],
+        additional_value: Optional[Dict[str, str]] = None,
+        join_model: Optional[Any] = None,
+        common_fields: Optional[
+            List[Union[str, Tuple[str, str]]]
+        ] = None,  # Common join fields
+        joined_fields: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        params = params or {}
+        pipeline = []
+        projection_stage = {}
+        combined_query = {}
+        sort_criteria = {}
+
+        skip_count = int(params.pop("skip", 0))
+        limit_count = int(params.pop("pick", 0))
+
+        sort_param = params.pop("sort", None)
+        if sort_param:
+            for field in sort_param.split(","):
+                if field.startswith("-"):
+                    # Descending sort
+                    sort_criteria[field[1:]] = -1
+                else:
+                    # Ascending sort
+                    sort_criteria[field] = 1
+
+        # --- Prepare dynamic lookups based on params and projections ---
+        lookup_stages, base_filters, lookup_filters, unwind_paths = (
+            self._extract_lookups_from_params(self.model, params, projection)
+        )
+
+        pipeline.append(
+            {
+                "$unwind": {
+                    "path": "$school_id.university_id.body",
+                    "preserveNullAndEmptyArrays": True,
+                }
+            }
+        )
+
+        pipeline.extend(lookup_stages)
+
+        # --- Match stage: Combine base and lookup filters ---
+        if base_filters:
+            combined_query.update(self.query_builder(base_filters))
+        if lookup_filters:
+            combined_query.update(self.query_builder(lookup_filters))
+
+        if combined_query:
+            pipeline.append({"$match": combined_query})
+
+        if sort_criteria:
+            pipeline.append({"$sort": sort_criteria})
+
+        # --- Build projection stage ---
+        if projection:
+            for item in projection:
+                if isinstance(item, str):
+                    projection_stage[item] = f"${item}"
+                elif isinstance(item, tuple):
+                    field_path, alias = item
+                    projection_stage[alias] = f"${field_path}"
+
+        elif not projection:
+            for field_name in self.model.__annotations__.keys():
+                projection_stage[field_name] = f"${field_name}"
+
+        if additional_value:
+            self.add_extra_value_to_pipeline(additional_value, pipeline)
+
+        if join_model and common_fields and joined_fields:
+            self.add_joined_fields_from_model(
+                pipeline=pipeline,
+                join_model=join_model,
+                common_fields=common_fields,
+                joined_fields=joined_fields,
+            )
+
+        if projection_stage:
+            pipeline.append({"$project": projection_stage})
+
+        # --- Grouping ---
+        if group_by_field:
+            group_stage = {"_id": f"${group_by_field}"}
+            push_fields = defaultdict(list)
+            first_fields = {}
+
+            for alias, source in projection_stage.items():
+                if alias == "_id":
+                    continue
+
+                if isinstance(source, str):
+                    root = source.replace("$", "").split(".")[0]
+
+                    # Group embedded fields under their top-level root
+                    if "." in source:
+                        push_fields[root].append((alias, f"${alias}"))
+                    else:
+                        first_fields[alias] = f"${alias}"
+
+            for root, fields in push_fields.items():
+                group_stage[root] = {"$addToSet": {k: v for k, v in fields}}
+
+            for alias, source in first_fields.items():
+                group_stage[alias] = {"$first": source}
+
+            pipeline.append({"$group": group_stage})
+
+        # --- Pagination stages ---
+        if skip_count:
+            pipeline.append({"$skip": skip_count})
+        if limit_count:
+            pipeline.append({"$limit": limit_count})
+
+        results = await self.collection.aggregate(
+            pipeline, allowDiskUse=True
+        ).to_list(length=None)
+
+        return [self.convert_to_serializable(doc) for doc in results]
+
+    async def search0(
         self,
         params: Dict[str, Any] = {},
         projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
@@ -540,26 +821,102 @@ class CommonDAO(AsyncDAOProtocol):
     def add_extra_value_to_pipeline(
         self, additional_value: Dict[str, str], pipeline: List[Dict[str, Any]]
     ):
-        pipeline.extend(
-            [
-                {
-                    "$addFields": {
-                        field_name: {
-                            "$concat": [
-                                base_path,
-                                (
-                                    f"${'.'.join(field_parts[:-1])}.{field_parts[-1]}"
-                                    if "." in field_name
-                                    else f"${field_name}"
-                                ),
-                            ]
-                        }
+        add_fields_stage = [
+            {
+                "$addFields": {
+                    field_name: {
+                        "$concat": [
+                            base_path,
+                            (
+                                f"${'.'.join(field_name.split('.')[:-1])}.{field_name.split('.')[-1]}"
+                                if "." in field_name
+                                else f"${field_name}"
+                            ),
+                        ]
                     }
                 }
-                for field_name, base_path in additional_value.items()
-                for field_parts in [field_name.split(".")]
+            }
+            for field_name, base_path in additional_value.items()
+        ]
+        pipeline.extend(add_fields_stage)
+
+    def add_joined_fields_from_model(
+        self,
+        pipeline: List[Dict],
+        join_model,
+        common_fields: List[str],
+        joined_fields: List[str],
+    ):
+        let_expr = {field: f"${field}" for field in common_fields}
+        match_expr = {
+            "$expr": {
+                "$and": [
+                    {"$eq": [f"${field}", f"$${field}"]}
+                    for field in common_fields
+                ]
+            }
+        }
+
+        lookup_stage = {
+            "$lookup": {
+                "from": join_model.Meta.collection._collection.name,
+                "let": let_expr,
+                "pipeline": [
+                    {"$match": match_expr},
+                    {"$project": {field: 1 for field in joined_fields}},
+                ],
+                "as": "ref_data",
+            }
+        }
+
+        pipeline.extend(
+            [
+                lookup_stage,
+                {
+                    "$unwind": {
+                        "path": "$ref_data",
+                        "preserveNullAndEmptyArrays": True,
+                    }
+                },
+                {
+                    "$addFields": {
+                        field: f"$ref_data.{field}" for field in joined_fields
+                    }
+                },
+                {"$project": {"ref_data": 0}},
             ]
         )
+
+    def replace_choice_fields_with_display(
+        data: Union[Dict, List[Dict]],
+        model,
+        fields: Optional[List[str]] = None,
+    ) -> Union[Dict, List[Dict]]:
+        if not data:
+            return data
+
+        is_single = isinstance(data, dict)
+        documents = [data] if is_single else data
+
+        # Get mapping for all fields with choices
+        field_choice_map = {
+            field_name: dict(field.field_info.extra.get("choices", []))
+            for field_name, field in model.__fields__.items()
+            if "choices" in field.field_info.extra
+        }
+
+        # Optional filter for specific fields
+        if fields:
+            field_choice_map = {
+                k: v for k, v in field_choice_map.items() if k in fields
+            }
+
+        for doc in documents:
+            for field_name, choices_dict in field_choice_map.items():
+                if field_name in doc and doc[field_name] in choices_dict:
+                    doc[field_name] = choices_dict[doc[field_name]]
+
+        return documents[0] if is_single else documents
 
     # ===========================EMBEDDED ARRAY HARD CODED============WORKING CODE=========
 

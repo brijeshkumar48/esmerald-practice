@@ -62,6 +62,11 @@ class UploadedMediaFile(BaseDocument):
     def get_dbtype():
         return "uploaded_media_file"
 
+SchoolBoardChoices = (
+    ("ST", "State Board"),
+    ("CB", "CBSE"),
+    ("IC", "ICSC"),
+)
 
 class Continent(BaseDocument):
     continent_name: str = mongoz.String()
@@ -103,13 +108,6 @@ class University(BaseDocument):
         collection = "universities"
 
 
-SchoolBoardChoices = (
-    ("ST", "State Board"),
-    ("CB", "CBSE"),
-    ("IC", "ICSC"),
-)
-
-
 class School(BaseDocument):
     name: str = mongoz.String()
     board: str = mongoz.String(choices=SchoolBoardChoices)
@@ -132,10 +130,15 @@ class Address(EmbeddedDocument):
         database = "test_database"
         collection = "address"
 
+    @staticmethod
+    def get_dbtype():
+        return "address"
+
 
 class Student(BaseDocument):
     name: str = mongoz.String()
     std: str = mongoz.String()
+    mobile_number: str = mongoz.String()
     school_id: ObjectId = ForeignKey(School)
     # address: Address = mongoz.EmbeddedDocument()
     address: List[Address] = mongoz.Array(Address, default=[])
@@ -145,6 +148,10 @@ class Student(BaseDocument):
         database = "test_database"
         collection = "students"
 
+    @classmethod
+    def get_dbtype(cls) -> str:
+        return "students"
+
 
 class Zone(BaseDocument):
     zone_name: str = mongoz.String()
@@ -153,3 +160,15 @@ class Zone(BaseDocument):
         registry = registry
         database = "test_database"
         collection = "zone"
+
+
+class Section(BaseDocument):
+    section: str = mongoz.String()
+    std: str = mongoz.String()
+    mobile_number: str = mongoz.String()
+    school_id: ObjectId = ForeignKey(School)
+
+    class Meta:
+        registry = registry
+        database = "test_database"
+        collection = "sections"

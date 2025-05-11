@@ -7,7 +7,13 @@ from bson import ObjectId
 from esmerald import Form, Query, Response, get, post, delete, Request, status
 from app.commonDao import CommonDAO
 from app.llm_service import call_llm
-from app.models.app_models import Address, School, Student, UploadedMediaFile
+from app.models.app_models import (
+    Address,
+    School,
+    Section,
+    Student,
+    UploadedMediaFile,
+)
 from app.models.stuDao import StudentDAO
 from app.utils import generate_response, validate_uploaded_files_path
 
@@ -161,26 +167,20 @@ async def stu_details(
 
     stu = await student_dao.search(
         params=q,
-        # unwind_fields=[
-        #     "address",
-        #     "address.country_id",
-        #     "address.country_id.continent_id",
-        #     "school_id.university_id.body",
-        #     "school_id.university_id.body.body_name",
-        # ],
-        group_by_field="name",
+        group_by_field="_id",
         projection=[
             "name",
             "std",
+            "section",
+            "mobile_number",
             ("address.village", "village"),
-            ("address.state", "state"),
-            ("address.pincode", "pincode"),
             ("address.country_id.country_name", "country_name"),
             (
                 "address.country_id.continent_id.continent_name",
                 "continent_name",
             ),
             ("school_id.name", "school_name"),
+            ("school_id.board", "school_board"),
             ("school_id.university_id.un_name", "university_name"),
             ("school_id.university_id.body.body_name", "body_name"),
             (
@@ -188,7 +188,9 @@ async def stu_details(
                 "body_country_name",
             ),
         ],
-        # additional_value={"school_id.name": "ttttttttttttttttt"},
+        common_fields=["mobile_number", "stschool_id"],
+        join_model=Section,
+        joined_fields=["section"],
     )
 
     # formatted_data = transform_search_results(stu)
@@ -198,6 +200,63 @@ async def stu_details(
         data=stu,
         message="Ok",
     )
+
+
+# add_joined_fields_from_model(
+#     pipeline=pipeline,
+#     join_model=School,
+#     common_fields=[("school_id", "_id"), ("mobile_number", "mobile_number")],
+#     joined_fields=["name", "board"]
+# )
+
+
+# unwind_fields=[
+#     "address",
+#     "address.country_id",
+#     "address.country_id.continent_id",
+#     "school_id.university_id.body",
+#     "school_id.university_id.body.body_name",
+# ],
+# common_fields=["std", "school_id"],
+# join_model=Section,
+# joined_fields=["section"],
+# group_by_field="_id",
+
+# stu = await student_dao.search(
+#         params=q,
+#         # unwind_fields=[
+#         #     "address",
+#         #     "address.country_id",
+#         #     "address.country_id.continent_id",
+#         #     "school_id.university_id.body",
+#         #     "school_id.university_id.body.body_name",
+#         # ],
+#         # common_fields=["std", "school_id"],
+#         # join_model=Section,
+#         # joined_fields=["section"],
+#         # group_by_field="_id",
+#         projection=[
+#             "name",
+#             #     # "section",
+#             #     "std",
+#             ("address.village", "village"),
+#             #     ("address.state", "state"),
+#             #     ("address.pincode", "pincode"),
+#             #     ("address.country_id.country_name", "country_name"),
+#             #     (
+#             #         "address.country_id.continent_id.continent_name",
+#             #         "continent_name",
+#             #     ),
+#             ("school_id.name", "school_name"),
+#             #     ("school_id.university_id.un_name", "university_name"),
+#             #     ("school_id.university_id.body.body_name", "body_name"),
+#             #     (
+#             #         "school_id.university_id.body.country_id.country_name",
+#             #         "body_country_name",
+#             #     ),
+#         ],
+#         # additional_value={"school_id.name": "ttttttttttttttttt"},
+#     )
 
 
 def transform_search_results(stu: list[dict]) -> list[dict]:
