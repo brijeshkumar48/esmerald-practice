@@ -522,12 +522,38 @@ class CommonDAO(AsyncDAOProtocol):
         group_by_field: Optional[str] = None,
         unwind_fields: Optional[List[str]] = [],
         additional_value: Optional[Dict[str, str]] = None,
-        join_model: Optional[Any] = None,
-        common_fields: Optional[
-            List[Union[str, Tuple[str, str]]]
-        ] = None,  # Common join fields
-        joined_fields: Optional[List[str]] = None,
+        external_pipeline: Optional[List[Dict]] = None,
     ) -> List[Dict[str, Any]]:
+        """
+        Highly optimized search using smarter lookup generation and unwind handling.
+        - Dynamically builds aggregation pipelines with lookups, matches, projections, sorting, and pagination.
+        example::
+        http://localhost:8000/api/stu/student?sort=-school_id.name&address.country_id.country_name__sw=I
+        http://localhost:8000/api/stu/student?sort=-school_id.name&address.country_id.continent_id.continent_name__sw=E
+        http://localhost:8000/api/stu/student?sort=-school_id.name&address.country_id.continent_id.continent_name__eq=Asia
+
+        search(
+        params=q,
+        projection=[
+                "name",
+                "std",
+                ("address.state", "state"),
+                ("address.pincode", "pincode"),
+                ("address.country_id.country_name", "country_name"),
+                ("address.country_id._id", "country_id"),
+                (
+                    "address.country_id.continent_id.continent_name",
+                    "continent_name",
+                ),
+                ("school_id.name", "school_name"),
+                ("school_id.board", "school_board"),
+                ("school_id._id", "school_id"),
+                ("school_id.university_id.un_name", "university_name"),
+                ("school_id.university_id._id", "university_id"),
+            ],
+        )
+
+        """
         params = params or {}
         pipeline = []
         projection_stage = {}
@@ -550,15 +576,6 @@ class CommonDAO(AsyncDAOProtocol):
         # --- Prepare dynamic lookups based on params and projections ---
         lookup_stages, base_filters, lookup_filters, unwind_paths = (
             self._extract_lookups_from_params(self.model, params, projection)
-        )
-
-        pipeline.append(
-            {
-                "$unwind": {
-                    "path": "$school_id.university_id.body",
-                    "preserveNullAndEmptyArrays": True,
-                }
-            }
         )
 
         pipeline.extend(lookup_stages)
@@ -591,13 +608,8 @@ class CommonDAO(AsyncDAOProtocol):
         if additional_value:
             self.add_extra_value_to_pipeline(additional_value, pipeline)
 
-        if join_model and common_fields and joined_fields:
-            self.add_joined_fields_from_model(
-                pipeline=pipeline,
-                join_model=join_model,
-                common_fields=common_fields,
-                joined_fields=joined_fields,
-            )
+        if external_pipeline:
+            pipeline.extend(external_pipeline)
 
         if projection_stage:
             pipeline.append({"$project": projection_stage})
@@ -641,6 +653,76 @@ class CommonDAO(AsyncDAOProtocol):
 
         return [self.convert_to_serializable(doc) for doc in results]
 
+    def add_extra_value_to_pipeline(
+        self, additional_value: Dict[str, str], pipeline: List[Dict[str, Any]]
+    ):
+        add_fields_stage = [
+            {
+                "$addFields": {
+                    field_name: {
+                        "$concat": [
+                            base_path,
+                            (
+                                f"${'.'.join(field_name.split('.')[:-1])}.{field_name.split('.')[-1]}"
+                                if "." in field_name
+                                else f"${field_name}"
+                            ),
+                        ]
+                    }
+                }
+            }
+            for field_name, base_path in additional_value.items()
+        ]
+        pipeline.extend(add_fields_stage)
+
+    def add_joined_fields_from_model(
+        self,
+        pipeline: List[Dict],
+        join_model,
+        common_fields: List[str],
+        joined_fields: List[str],
+    ):
+        let_expr = {field: f"${field}" for field in common_fields}
+        match_expr = {
+            "$expr": {
+                "$and": [
+                    {"$eq": [f"${field}", f"$${field}"]}
+                    for field in common_fields
+                ]
+            }
+        }
+
+        lookup_stage = {
+            "$lookup": {
+                "from": join_model.Meta.collection._collection.name,
+                "let": let_expr,
+                "pipeline": [
+                    {"$match": match_expr},
+                    {"$project": {field: 1 for field in joined_fields}},
+                ],
+                "as": "ref_data",
+            }
+        }
+
+        pipeline.extend(
+            [
+                lookup_stage,
+                {
+                    "$unwind": {
+                        "path": "$ref_data",
+                        "preserveNullAndEmptyArrays": True,
+                    }
+                },
+                {
+                    "$addFields": {
+                        field: f"$ref_data.{field}" for field in joined_fields
+                    }
+                },
+                {"$project": {"ref_data": 0}},
+            ]
+        )
+
+    '''
     async def search0(
         self,
         params: Dict[str, Any] = {},
@@ -818,75 +900,6 @@ class CommonDAO(AsyncDAOProtocol):
 
         return [self.convert_to_serializable(doc) for doc in results]
 
-    def add_extra_value_to_pipeline(
-        self, additional_value: Dict[str, str], pipeline: List[Dict[str, Any]]
-    ):
-        add_fields_stage = [
-            {
-                "$addFields": {
-                    field_name: {
-                        "$concat": [
-                            base_path,
-                            (
-                                f"${'.'.join(field_name.split('.')[:-1])}.{field_name.split('.')[-1]}"
-                                if "." in field_name
-                                else f"${field_name}"
-                            ),
-                        ]
-                    }
-                }
-            }
-            for field_name, base_path in additional_value.items()
-        ]
-        pipeline.extend(add_fields_stage)
-
-    def add_joined_fields_from_model(
-        self,
-        pipeline: List[Dict],
-        join_model,
-        common_fields: List[str],
-        joined_fields: List[str],
-    ):
-        let_expr = {field: f"${field}" for field in common_fields}
-        match_expr = {
-            "$expr": {
-                "$and": [
-                    {"$eq": [f"${field}", f"$${field}"]}
-                    for field in common_fields
-                ]
-            }
-        }
-
-        lookup_stage = {
-            "$lookup": {
-                "from": join_model.Meta.collection._collection.name,
-                "let": let_expr,
-                "pipeline": [
-                    {"$match": match_expr},
-                    {"$project": {field: 1 for field in joined_fields}},
-                ],
-                "as": "ref_data",
-            }
-        }
-
-        pipeline.extend(
-            [
-                lookup_stage,
-                {
-                    "$unwind": {
-                        "path": "$ref_data",
-                        "preserveNullAndEmptyArrays": True,
-                    }
-                },
-                {
-                    "$addFields": {
-                        field: f"$ref_data.{field}" for field in joined_fields
-                    }
-                },
-                {"$project": {"ref_data": 0}},
-            ]
-        )
-
     def replace_choice_fields_with_display(
         data: Union[Dict, List[Dict]],
         model,
@@ -919,6 +932,7 @@ class CommonDAO(AsyncDAOProtocol):
         return documents[0] if is_single else documents
 
     # ===========================EMBEDDED ARRAY HARD CODED============WORKING CODE=========
+    '''
 
     '''
     def _extract_lookups_from_params(

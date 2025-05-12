@@ -165,6 +165,49 @@ async def stu_details(
 
     # stu = await student_dao.get_all()
 
+    external_pipeline = [
+        # Step 1: Add a new field 'school_id_for_join' to ensure proper referencing
+        {
+            "$addFields": {
+                "school_id_for_join": {
+                    "$ifNull": ["$school_id._id", "$school_id"]
+                }
+            }
+        },  # Safeguard against null values
+        # Step 2: Lookup stage
+        {
+            "$lookup": {
+                "from": "sections",  # Your target collection (e.g., "sections")
+                "let": {
+                    "school_id": "$school_id_for_join",
+                    "std": "$std",
+                },  # Use the new field for lookup
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$std", "$$std"]},
+                                    {"$eq": ["$school_id", "$$school_id"]},
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$project": {"section": 1}
+                    },  # Only return the 'section' field
+                ],
+                "as": "ref_data",  # Resulting array
+            }
+        },
+        # Step 3: Unwind the 'ref_data' array to flatten the result
+        {"$unwind": {"path": "$ref_data", "preserveNullAndEmptyArrays": True}},
+        # Step 4: Add 'section' from 'ref_data'
+        {"$addFields": {"section": "$ref_data.section"}},
+        # Step 5: Remove the 'ref_data' field as it is no longer needed
+        {"$project": {"ref_data": 0}},
+    ]
+
     stu = await student_dao.search(
         params=q,
         group_by_field="_id",
@@ -188,9 +231,7 @@ async def stu_details(
                 "body_country_name",
             ),
         ],
-        common_fields=["mobile_number", "stschool_id"],
-        join_model=Section,
-        joined_fields=["section"],
+        external_pipeline=external_pipeline,  # <-- PASS IT HERE
     )
 
     # formatted_data = transform_search_results(stu)
