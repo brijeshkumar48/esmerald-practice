@@ -62,11 +62,13 @@ class UploadedMediaFile(BaseDocument):
     def get_dbtype():
         return "uploaded_media_file"
 
+
 SchoolBoardChoices = (
     ("ST", "State Board"),
     ("CB", "CBSE"),
     ("IC", "ICSC"),
 )
+
 
 class Continent(BaseDocument):
     continent_name: str = mongoz.String()
@@ -76,6 +78,15 @@ class Continent(BaseDocument):
         registry = registry
         database = "test_database"
         collection = "continents"
+
+
+class Zone(BaseDocument):
+    zone_name: str = mongoz.String()
+
+    class Meta:
+        registry = registry
+        database = "test_database"
+        collection = "zone"
 
 
 class Country(BaseDocument):
@@ -135,11 +146,25 @@ class Address(EmbeddedDocument):
         return "address"
 
 
+class Batch(BaseDocument):
+    batch_no = mongoz.String()
+
+    class Meta:
+        registry = registry
+        database = "test_database"
+        collection = "batches"
+
+    @staticmethod
+    def get_dbtype():
+        return "batches"
+
+
 class Student(BaseDocument):
     name: str = mongoz.String()
     std: str = mongoz.String()
     mobile_number: str = mongoz.String()
     school_id: ObjectId = ForeignKey(School)
+    batch_id: ObjectId = ForeignKey(Batch)
     # address: Address = mongoz.EmbeddedDocument()
     address: List[Address] = mongoz.Array(Address, default=[])
 
@@ -153,20 +178,12 @@ class Student(BaseDocument):
         return "students"
 
 
-class Zone(BaseDocument):
-    zone_name: str = mongoz.String()
-
-    class Meta:
-        registry = registry
-        database = "test_database"
-        collection = "zone"
-
-
 class Section(BaseDocument):
     section: str = mongoz.String()
     std: str = mongoz.String()
     mobile_number: str = mongoz.String()
     school_id: ObjectId = ForeignKey(School)
+    batch_id: ObjectId = ForeignKey(Batch)
 
     class Meta:
         registry = registry
