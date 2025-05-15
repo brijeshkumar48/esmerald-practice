@@ -14,6 +14,7 @@ from typing import (
     Annotated,
     get_args,
 )
+from asyncio import gather
 from datetime import datetime
 from mongoz import EmbeddedDocument
 from pydantic import Field
@@ -208,6 +209,11 @@ class CommonDAO(AsyncDAOProtocol):
 
         return query
 
+    def make_count_pipeline(self, base_pipeline: List[Dict]) -> List[Dict]:
+        count_pipeline = base_pipeline.copy()
+        count_pipeline.append({"$count": "total_count"})
+        return count_pipeline
+
     def _extract_lookups_from_params(
         self,
         model,
@@ -361,7 +367,7 @@ class CommonDAO(AsyncDAOProtocol):
 
         return lookup_stages, base_params, lookup_params, unwind_paths
 
-    def _extract_lookups_from_params0(
+    def _extract_lookups_from_params_old(
         self,
         model,
         params: Dict[str, Any],
@@ -523,37 +529,8 @@ class CommonDAO(AsyncDAOProtocol):
         unwind_fields: Optional[List[str]] = [],
         additional_value: Optional[Dict[str, str]] = None,
         external_pipeline: Optional[List[Dict]] = None,
+        is_total_count: bool = False,
     ) -> List[Dict[str, Any]]:
-        """
-        Highly optimized search using smarter lookup generation and unwind handling.
-        - Dynamically builds aggregation pipelines with lookups, matches, projections, sorting, and pagination.
-        example::
-        http://localhost:8000/api/stu/student?sort=-school_id.name&address.country_id.country_name__sw=I
-        http://localhost:8000/api/stu/student?sort=-school_id.name&address.country_id.continent_id.continent_name__sw=E
-        http://localhost:8000/api/stu/student?sort=-school_id.name&address.country_id.continent_id.continent_name__eq=Asia
-
-        search(
-        params=q,
-        projection=[
-                "name",
-                "std",
-                ("address.state", "state"),
-                ("address.pincode", "pincode"),
-                ("address.country_id.country_name", "country_name"),
-                ("address.country_id._id", "country_id"),
-                (
-                    "address.country_id.continent_id.continent_name",
-                    "continent_name",
-                ),
-                ("school_id.name", "school_name"),
-                ("school_id.board", "school_board"),
-                ("school_id._id", "school_id"),
-                ("school_id.university_id.un_name", "university_name"),
-                ("school_id.university_id._id", "university_id"),
-            ],
-        )
-
-        """
         params = params or {}
         pipeline = []
         projection_stage = {}
@@ -641,17 +618,46 @@ class CommonDAO(AsyncDAOProtocol):
 
             pipeline.append({"$group": group_stage})
 
+        if is_total_count:
+            count_pipeline = self.make_count_pipeline(pipeline)
+            count_result = await self.collection.aggregate(
+                count_pipeline
+            ).to_list(length=1)
+            total_count = count_result[0]["total_count"] if count_result else 0
+
+            return {"results": [], "total_count": total_count}
+
         # --- Pagination stages ---
+        # if skip_count:
+        #     pipeline.append({"$skip": skip_count})
+        # if limit_count:
+        #     pipeline.append({"$limit": limit_count})
+
+        # results = await self.collection.aggregate(
+        #     pipeline, allowDiskUse=True
+        # ).to_list(length=None)
+
+        # return [self.convert_to_serializable(doc) for doc in results]
+
+        count_pipeline = self.make_count_pipeline(pipeline)
+        data_pipeline = pipeline.copy()
+
         if skip_count:
-            pipeline.append({"$skip": skip_count})
+            data_pipeline.append({"$skip": skip_count})
         if limit_count:
-            pipeline.append({"$limit": limit_count})
+            data_pipeline.append({"$limit": limit_count})
 
-        results = await self.collection.aggregate(
-            pipeline, allowDiskUse=True
-        ).to_list(length=None)
+        count_result, data_result = await gather(
+            self.collection.aggregate(count_pipeline).to_list(length=1),
+            self.collection.aggregate(
+                data_pipeline, allowDiskUse=True
+            ).to_list(length=None),
+        )
 
-        return [self.convert_to_serializable(doc) for doc in results]
+        total_count = count_result[0]["total_count"] if count_result else 0
+        results = [self.convert_to_serializable(doc) for doc in data_result]
+
+        return results
 
     def add_extra_value_to_pipeline(
         self, additional_value: Dict[str, str], pipeline: List[Dict[str, Any]]

@@ -159,6 +159,19 @@ class Batch(BaseDocument):
         return "batches"
 
 
+class Generation(BaseDocument):
+    generation: str = mongoz.String()
+
+    class Meta:
+        registry = registry
+        database = "test_database"
+        collection = "generations"
+
+    @classmethod
+    def get_dbtype(cls) -> str:
+        return "generations"
+
+
 class Student(BaseDocument):
     name: str = mongoz.String()
     std: str = mongoz.String()
@@ -167,6 +180,7 @@ class Student(BaseDocument):
     batch_id: ObjectId = ForeignKey(Batch)
     # address: Address = mongoz.EmbeddedDocument()
     address: List[Address] = mongoz.Array(Address, default=[])
+    stu_generation_id: ObjectId = ForeignKey(Generation)
 
     class Meta:
         registry = registry
@@ -184,6 +198,7 @@ class Section(BaseDocument):
     mobile_number: str = mongoz.String()
     school_id: ObjectId = ForeignKey(School)
     batch_id: ObjectId = ForeignKey(Batch)
+    generation_id: ObjectId = ForeignKey(Generation)
 
     class Meta:
         registry = registry

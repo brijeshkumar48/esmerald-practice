@@ -20,19 +20,24 @@ from app.utils import generate_response, validate_uploaded_files_path
 
 # This is where files are stored in Nginx
 # MEDIA_PATH = "/var/lib/playmity/media/"
-MEDIA_PATH = "/media"
 
 
 @get()
 @validate_uploaded_files_path()
-async def protected_file(request: Request, file_path: str) -> Response:
-    print("file_path =======>", file_path)
+async def protected_file(
+    request: Request,
+    rel_file_path: str,
+) -> Response:
 
-    full_path = os.path.join(MEDIA_PATH, file_path)
+    MEDIA_PATH = "/data"
+
+    print("rel_file_path =======>", rel_file_path)
+
+    full_path = os.path.join(MEDIA_PATH, rel_file_path)
     print("full_path =======>", full_path)
 
     # Optional: Validate allowed extensions
-    if not file_path.lower().endswith((".jpg", ".png", ".pdf", ".txt")):
+    if not rel_file_path.lower().endswith((".jpg", ".png", ".pdf", ".txt")):
         return Response(content="Invalid file type", status_code=400)
 
     if not os.path.exists(full_path):
@@ -40,7 +45,7 @@ async def protected_file(request: Request, file_path: str) -> Response:
 
     return generate_response(
         request=request,
-        extra_headers={"X-Accel-Redirect": f"/privateFile/{file_path}"},
+        extra_headers={"X-Accel-Redirect": f"/privateFile/{rel_file_path}"},
         data={},
         message="Ok",
     )
@@ -57,10 +62,7 @@ async def upload_file(
     uploaded_file = data.get("path")
     file_type = data.get("type")
 
-    # Absolute path where file will be saved inside the container
-    # ABSOLUTE_UPLOAD_DIR = "/media/uploaded-files"
-
-    UPLOAD_DIR = os.getenv("UPLOAD_DIR", "media/uploaded-files")
+    UPLOAD_DIR = os.getenv("UPLOAD_DIR", "data/company_code/uploaded-files")
     ABSOLUTE_UPLOAD_DIR = Path(UPLOAD_DIR)
     ABSOLUTE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -71,7 +73,9 @@ async def upload_file(
 
     # Relative path to be stored in DB (used in download)
     relative_path = os.path.normpath(
-        os.path.join("media/uploaded-files", uploaded_file.filename)
+        os.path.join(
+            "data/company_code/uploaded-files", uploaded_file.filename
+        )
     ).replace(os.sep, "/")
 
     data = {
@@ -91,7 +95,10 @@ async def upload_file(
 
 @post("/generate")
 async def llm_response(
-    system_prompt: str, user_message: str, request: Request, **kwargs: Any
+    system_prompt: str,
+    user_message: str,
+    request: Request,
+    **kwargs: Any,
 ) -> Response:
     output = await call_llm(system_prompt, user_message)
     return generate_response(
@@ -166,6 +173,39 @@ async def stu_details(
     # stu = await student_dao.get_all()
 
     external_pipeline = [
+        # Step 1: Prepare safe join field for generation
+        {
+            "$addFields": {
+                "generation_id_for_join": {
+                    "$ifNull": ["$stu_generation_id._id", "$stu_generation_id"]
+                }
+            }
+        },
+        # Step 2: Lookup from 'sections' using generation_id
+        {
+            "$lookup": {
+                "from": "sections",
+                "let": {"generation_id": "$generation_id_for_join"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$eq": ["$generation_id", "$$generation_id"]
+                            }
+                        }
+                    },
+                    {"$project": {"section": 1}},
+                ],
+                "as": "ref_data",
+            }
+        },
+        # Step 3: Unwind and flatten
+        {"$unwind": {"path": "$ref_data", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {"section": "$ref_data.section"}},
+        {"$project": {"ref_data": 0}},
+    ]
+
+    external_pipeline_fk_fk = [
         # Step 1: Add safe join fields
         {
             "$addFields": {
@@ -253,6 +293,7 @@ async def stu_details(
     stu = await student_dao.search(
         params=q,
         group_by_field="_id",
+        # is_total_count=True,
         projection=[
             "name",
             "std",
@@ -273,7 +314,7 @@ async def stu_details(
                 "body_country_name",
             ),
         ],
-        external_pipeline=external_pipeline,  # <-- PASS IT HERE
+        external_pipeline=external_pipeline,
     )
 
     # formatted_data = transform_search_results(stu)
