@@ -27,13 +27,13 @@ class ForeignKey(FieldFactory, ObjectId):
                 for key, value in locals().items()
                 if key not in CLASS_DEFAULTS
             },
-            # "null": null,
-            # "json_schema_extra": {
-            #     "Meta": {
-            #         "ref": model.__name__,
-            #         "ref_model": model,
-            #     }
-            # },
+            "null": null,
+            "json_schema_extra": {
+                "Meta": {
+                    "ref": model.__name__,
+                    "ref_model": model,
+                }
+            },
         }
         return super().__new__(cls, **kwargs)
 
@@ -61,13 +61,6 @@ class UploadedMediaFile(BaseDocument):
     @staticmethod
     def get_dbtype():
         return "uploaded_media_file"
-
-
-SchoolBoardChoices = (
-    ("ST", "State Board"),
-    ("CB", "CBSE"),
-    ("IC", "ICSC"),
-)
 
 
 class Continent(BaseDocument):
@@ -117,6 +110,13 @@ class University(BaseDocument):
         registry = registry
         database = "test_database"
         collection = "universities"
+
+
+SchoolBoardChoices = (
+    ("ST", "State Board"),
+    ("CB", "CBSE"),
+    ("IC", "ICSC"),
+)
 
 
 class School(BaseDocument):
@@ -175,6 +175,9 @@ class Generation(BaseDocument):
 class Student(BaseDocument):
     name: str = mongoz.String()
     std: str = mongoz.String()
+    roll_no: int = mongoz.Integer()
+    obtained_pct: float = mongoz.Decimal(decimal_places=5, max_digits=10)
+    is_pass: bool = (mongoz.Boolean(),)
     mobile_number: str = mongoz.String()
     school_id: ObjectId = ForeignKey(School)
     batch_id: ObjectId = ForeignKey(Batch)

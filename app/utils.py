@@ -78,3 +78,9 @@ def validate_uploaded_files_path():
         return wrapper
 
     return decorator
+
+
+class BadRequest(Exception):
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)

@@ -1,10 +1,16 @@
 import ast
 from collections import defaultdict
 import datetime
+from decimal import Decimal
+import json
+import logging
+from bson.errors import InvalidId
+from dateutil import parser
 from pprint import pformat
 from typing import (
     Any,
     Dict,
+    Generator,
     List,
     Optional,
     Union,
@@ -23,9 +29,10 @@ from bson import ObjectId
 from esmerald import AsyncDAOProtocol
 from motor.motor_asyncio import AsyncIOMotorClient
 import re
+from app.utils import BadRequest
 from config.settings import settings
-from bson import ObjectId
-from typing import Any, Dict
+
+logger = logging.getLogger(__name__)
 
 
 class CommonDAO(AsyncDAOProtocol):
@@ -51,180 +58,330 @@ class CommonDAO(AsyncDAOProtocol):
         def convert(value):
             if isinstance(value, ObjectId):
                 return str(value)
+            elif isinstance(value, datetime):
+                return value.isoformat()
+            elif isinstance(value, Decimal):
+                return float(value)
             elif isinstance(value, dict):
                 return {k: convert(v) for k, v in value.items()}
             elif isinstance(value, list):
                 return [convert(v) for v in value]
-            return value
+            return value  # int, float, bool, None are untouched
 
         return convert(doc)
 
-    def _auto_cast(self, val: Any) -> Any:
+    async def query_builder(self, filters: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Attempt to convert the value to a datetime object.
-        If parsing fails, return the original value.
-        """
-        if not isinstance(val, str):
-            return val
+        This function interprets filter keys that may include custom operator suffixes
+        (e.g., `age__gt`, `name__ico`) and converts them into appropriate MongoDB query syntax.
 
-        # Try ISO format
+        Supported operators (configured in `settings.query_param_operators`) include:
+            - "eq"  : Equality (default operator if no suffix is found)
+            - "in"  : Inclusion in a list of values
+            - "be"  : Between two values (range query using $gte and $lte)
+            - "lt", "lte", "gt", "gte" : Comparison operators
+            - "nq"  : Not equal
+            - "sw", "ew", "co", "ico", "ieq" : String pattern matching using regular expressions
+
+        Args:
+            filters (Dict[str, Any]): A dictionary where keys may include a field name and optional
+                operator suffix (e.g., "price__gt") and values are the corresponding filter values.
+
+        Returns:
+            Dict[str, Any]: A dictionary formatted for MongoDB queries, using operators like
+                `$eq`, `$in`, `$gte`, `$lte`, `$regex`, etc.
+
+        Raises:
+            BadRequest: If an unsupported operator is used, or required values are missing (e.g.,
+            'be' operator not given exactly two values).
+
+        Example:
+            ?master_id._id__in=[6818763ecb22153e7a47d413,6818765acb22153e7a47d415]
+            filters = {
+                "price__gt": 100,
+                "name__ico": "phone",
+                "created__be": ["2021-01-01", "2021-12-31"]
+            }
+            query = await query_builder(filters)
+            # Result:
+            # {
+            #   "price": {"$gt": 100},
+            #   "name": {"$regex": re.compile(".*phone.*", re.IGNORECASE)},
+            #   "created": {"$gte": <parsed_date>, "$lte": <parsed_date>}
+            # }
+        """
+        query = {}
+        OPERATORS = settings.query_param_operators
+
+        for key, value in filters.items():
+            result = self.extract_field_and_operator(key, OPERATORS)
+            if not result:
+                logger.warning(f"Unsupported filter operator in key: {key}")
+                continue
+
+            field, operator = result
+
+            mongo_op = OPERATORS[operator]
+
+            if operator == "in":
+                value = self.__parse_str_to_list(value)
+
+                if not isinstance(value, list):
+                    raise BadRequest(
+                        f"'in' operator requires a list for field '{field}'"
+                    )
+
+                parsed_values = [
+                    self.__parse_values(field, val) for val in value
+                ]
+                query[field] = {mongo_op: parsed_values}
+
+            elif operator == "be":
+                value = self.__parse_str_to_list(value)
+
+                if isinstance(value, list) and len(value) == 2:
+                    try:
+                        value = [self.__auto_cast(v) for v in value]
+                    except Exception as e:
+                        raise BadRequest(
+                            f"Failed to parse 'between' values: {value}"
+                        ) from e
+
+                    query[field] = {"$gte": value[0], "$lte": value[1]}
+                else:
+                    raise BadRequest(
+                        f"Invalid value for 'between' operator on field '{field}': {value}"
+                    )
+
+            # Handle regex-based operators
+            elif operator in {"sw", "ew", "co", "ico", "ieq"}:
+                escaped_value = re.escape(value)
+                if operator == "sw":
+                    regex = f"^{escaped_value}"
+                elif operator == "ew":
+                    regex = f"{escaped_value}$"
+                elif operator in {"co", "ico"}:
+                    regex = f".*{escaped_value}.*"
+                elif operator == "ieq":
+                    regex = f"^{escaped_value}$"
+
+                flags = re.I if operator in {"ico", "ieq"} else 0
+                query[field] = {"$regex": re.compile(regex, flags)}
+
+            elif operator in ["lt", "lte", "gt", "gte", "ne"]:
+                query[field] = {mongo_op: self.__parse_values(field, value)}
+
+            else:
+                query[field] = {mongo_op: self.__parse_values(field, value)}
+
+        return query
+
+    def __parse_values(self, key: str, value: str) -> Any:
+        """Parse values into appropriate types for MongoDB queries."""
+        if not isinstance(value, str):
+            return value
+
+        if key.endswith("_id"):
+            try:
+                return ObjectId(value)
+            except (InvalidId, TypeError):
+                logger.info(f"Invalid ObjectId for '{key}': {value}")
+
+        if value.isdigit():
+            return int(value)
+
         try:
-            return datetime.fromisoformat(val)
-        except ValueError:
+            return parser.isoparse(value)
+        except (ValueError, TypeError):
             pass
 
-        # Try common date formats
-        date_formats = [
-            "%Y-%m-%d",
-            "%d-%m-%Y",
-            "%d/%m/%Y",
-            "%m/%d/%Y",
-            "%Y/%m/%d",
-            "%Y-%m-%d %H:%M:%S",
-            "%d-%m-%Y %H:%M:%S",
-            "%m/%d/%Y %H:%M:%S",
-        ]
+        return value
 
+    def __parse_str_to_list(self, value: Union[str, list]) -> list:
+        if isinstance(value, list):
+            return value
+
+        if isinstance(value, str):
+            value = value.strip()
+            if value.startswith("[") and value.endswith("]"):
+                try:
+                    return ast.literal_eval(value)
+                except Exception:
+                    value = value.strip("[]").split(",")
+            else:
+                value = value.split(",")
+
+            return [v.strip() for v in value]
+
+        raise ValueError(
+            f"Expected a list or string that can be parsed as list, got {type(value)}"
+        )
+
+    def __auto_cast(self, val: str):
+        val = val.strip()
+        # Try datetime formats
+        date_formats = [
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d",
+        ]
         for fmt in date_formats:
             try:
                 return datetime.strptime(val, fmt)
             except ValueError:
                 continue
 
-        # Not a datetime, return as-is
+        # If int
+        try:
+            return int(val)
+        except ValueError:
+            pass
+
+        # if float
+        try:
+            return float(val)
+        except ValueError:
+            pass
+
         return val
 
-    def _parse_values(self, field: str, value: Any) -> Any:
-        # Handle ObjectId
-        if isinstance(value, str):
-            try:
-                return ObjectId(value)
-            except Exception:
-                pass
+    def extract_field_and_operator(
+        self, key: str, operators: dict
+    ) -> Optional[tuple[str, str]]:
+        """
+        Extract field and operator from a key. Return None if no valid operator is found.
+        """
+        for op in operators:
+            if key.endswith(f"__{op}"):
+                field = key[: -len(f"__{op}")]
+                return field, op
+        # If no __operator suffix, default to 'eq' only if operator is supported
+        if "__" not in key and "eq" in operators:
+            return key, "eq"
+        return None
 
-        # Try to safely evaluate values (e.g., convert "10" to int)
-        try:
-            return ast.literal_eval(value)
-        except Exception:
-            return value  # return raw string if evaluation fails
+    async def aggregate(self, pipeline: List) -> List:
+        """This method is use to aggregate the pipeline from DB."""
 
-    def _parse_str_to_list(self, value: Any) -> list:
-        if isinstance(value, list):
-            return value
+        result = await self.model.objects.using(
+            self.db
+        )._collection._async_aggregate(pipeline)
+        return list(result)
 
-        if isinstance(value, str):
-            try:
-                if value.startswith("[") and value.endswith("]"):
-                    parsed = ast.literal_eval(value)
-                    if isinstance(parsed, list):
-                        return parsed
-            except Exception:
-                pass
-            return [v.strip() for v in value.strip("[]").split(",")]
+    def add_extra_value_to_pipeline(
+        self, additional_value: Dict[str, str], pipeline: List[Dict[str, Any]]
+    ):
+        add_fields_stage = [
+            {
+                "$addFields": {
+                    field_name: {
+                        "$concat": [
+                            base_path,
+                            (
+                                f"${'.'.join(field_name.split('.')[:-1])}.{field_name.split('.')[-1]}"
+                                if "." in field_name
+                                else f"${field_name}"
+                            ),
+                        ]
+                    }
+                }
+            }
+            for field_name, base_path in additional_value.items()
+        ]
+        pipeline.extend(add_fields_stage)
 
-        raise ValueError("Invalid list format for 'in' or 'between' operator")
+    def collect_choice_label_fields(self, model, used_fields: set) -> dict:
+        add_fields = {}
 
-    def query_builder(self, filters: Dict[str, Any]) -> Dict[str, Any]:
-        query = {}
-        OPERATORS = {
-            "eq": "$eq",
-            "ne": "$ne",
-            "gt": "$gt",
-            "gte": "$gte",
-            "lt": "$lt",
-            "lte": "$lte",
-            "in": "$in",
-            "nin": "$nin",
-            "regex": "$regex",
-            "ieq": "ieq",
-            "be": "between",
-            "sw": "sw",
-            "ew": "ew",
-        }
+        for field_path in used_fields:
+            traversal = self.traverse_model_path(model, field_path)
+            for _, model_field, full_path in traversal:
+                if hasattr(model_field, "model") or self.is_embedded_field(
+                    model_field
+                ):
+                    continue
 
-        for key, value in filters.items():
-            field = key
-            operator = "eq"
+                choices = getattr(model_field, "choices", None)
+                if choices:
+                    branches = [
+                        {
+                            "case": {"$eq": [f"${full_path}", code]},
+                            "then": label,
+                        }
+                        for code, label in choices
+                    ]
+                    add_fields[full_path] = {
+                        "$switch": {
+                            "branches": branches,
+                            "default": f"${full_path}",
+                        }
+                    }
+                break
 
-            for op in OPERATORS:
-                if key.endswith(f"__{op}"):
-                    operator = op
-                    field = key.rsplit(f"__{op}", 1)[0]
-                    break
+        return add_fields
 
-            if operator not in OPERATORS:
-                raise ValueError(f"Unsupported operator: {operator}")
+    def is_embedded_field(self, model_field) -> bool:
+        ann = getattr(model_field, "annotation", None)
+        if get_origin(ann) is Union:
+            args = get_args(ann)
+            non_none_args = [arg for arg in args if arg is not type(None)]
+            if len(non_none_args) == 1:
+                ann = non_none_args[0]
+        if get_origin(ann) is list:
+            inner = get_args(ann)[0]
+            return hasattr(inner, "model_fields")
+        return hasattr(ann, "model_fields")
 
-            mongo_op = OPERATORS[operator]
+    def traverse_model_path(self, model, field_path: str) -> tuple:
+        """
+        Traverse a model and return a list of (field_name, model_field, full_path) tuples.
+        Each element represents a level in the field path.
+        """
+        path_parts = field_path.split(".")
+        current_model = model
+        current_path = ""
+        traversal = []
 
-            if operator == "in":
-                value = self._parse_str_to_list(value)
-                parsed_values = [
-                    self._parse_values(field, val) for val in value
-                ]
-                query[field] = {mongo_op: parsed_values}
+        for part in path_parts:
+            origin = get_origin(current_model)
+            if origin is Union:
+                args = get_args(current_model)
+                non_none_args = [arg for arg in args if arg is not type(None)]
+                if len(non_none_args) == 1:
+                    current_model = non_none_args[0]
+                    origin = get_origin(current_model)
+            if origin is list:
+                current_model = get_args(current_model)[0]
 
-            elif operator == "be":
-                value = self._parse_str_to_list(value)
-                if isinstance(value, list) and len(value) == 2:
-                    try:
-                        value = [self._auto_cast(v) for v in value]
-                        query[field] = {"$gte": value[0], "$lte": value[1]}
-                    except Exception as e:
-                        raise ValueError(
-                            f"Failed to parse 'between' values: {value}"
-                        ) from e
-                else:
-                    raise ValueError(
-                        f"'between' operator requires exactly two values for field '{field}'"
-                    )
+            model_fields = getattr(current_model, "model_fields", {})
+            model_field = model_fields.get(part)
+            if not model_field:
+                break
 
-            elif operator == "ieq":
-                if not isinstance(value, str):
-                    raise ValueError(
-                        f"'ieq' operator requires a string for field '{field}'"
-                    )
-                query[field] = {"$regex": f"^{value}$", "$options": "i"}
+            full_path = f"{current_path}.{part}" if current_path else part
+            traversal.append((part, model_field, full_path))
 
-            elif operator == "sw":
-                if not isinstance(value, str):
-                    raise ValueError(
-                        f"'sw' operator requires a string for field '{field}'"
-                    )
-                query[field] = {"$regex": f"^{value}", "$options": "i"}
-
-            elif operator == "ew":
-                if not isinstance(value, str):
-                    raise ValueError(
-                        f"'ew' operator requires a string for field '{field}'"
-                    )
-                query[field] = {"$regex": f"{value}$", "$options": "i"}
-
-            elif operator == "eq":
-                query[field] = self._parse_values(field, value)
-
+            if hasattr(model_field, "model"):
+                current_model = model_field.model
+            elif self.is_embedded_field(model_field):
+                ann = getattr(model_field, "annotation", None)
+                current_model = (
+                    get_args(ann)[0] if get_origin(ann) is list else ann
+                )
             else:
-                parsed_value = self._parse_values(field, value)
-                query[field] = {mongo_op: parsed_value}
+                # Scalar field, stop here
+                break
 
-        return query
+        current_path = full_path
 
-    def make_count_pipeline(self, base_pipeline: List[Dict]) -> List[Dict]:
-        count_pipeline = base_pipeline.copy()
-        count_pipeline.append({"$count": "total_count"})
-        return count_pipeline
+        return traversal
 
     def _extract_lookups_from_params(
         self,
         model,
-        params: Dict[str, Any],
+        params: dict,
         projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
-    ) -> tuple[list[dict], dict, dict, set]:
-        """
-        Optimized dynamic deep lookup extractor with proper unwind handling.
-        - Dynamically builds MongoDB $lookup and $unwind stages for nested relations.
-        - Separates parameters into base fields and lookup fields.
-        """
+    ) -> tuple[list, dict, dict, set]:
         if not params and not projection:
             return [], {}, {}, set()
 
@@ -232,45 +389,13 @@ class CommonDAO(AsyncDAOProtocol):
         base_params = {}
         lookup_params = {}
         unwind_paths = set()
-
-        def is_embedded_field(model_field) -> bool:
-            ann = getattr(model_field, "annotation", None)
-            if get_origin(ann) is Union:
-                args = get_args(ann)
-                non_none_args = [arg for arg in args if arg is not type(None)]
-                if len(non_none_args) == 1:
-                    ann = non_none_args[0]
-            if get_origin(ann) is list:
-                inner = get_args(ann)[0]
-                return hasattr(inner, "model_fields")
-            return hasattr(ann, "model_fields")
+        OPERATORS = settings.query_param_operators
 
         def add_lookup_chain(field_path: str):
-            parts = field_path.split(".")
-            current_model = model
-            current_path = ""
+            traversal = self.traverse_model_path(model, field_path)
 
-            for index, part in enumerate(parts):
-                origin = get_origin(current_model)
-                if origin is Union:
-                    args = get_args(current_model)
-                    non_none_args = [
-                        arg for arg in args if arg is not type(None)
-                    ]
-                    if len(non_none_args) == 1:
-                        current_model = non_none_args[0]
-                        origin = get_origin(current_model)
-                if origin is list:
-                    current_model = get_args(current_model)[0]
-
-                model_fields = getattr(current_model, "model_fields", {})
-                model_field = model_fields.get(part)
-                if not model_field:
-                    break
-
-                full_path = f"{current_path}.{part}" if current_path else part
-
-                if hasattr(model_field, "model"):  # ForeignKey relation
+            for index, (_, model_field, full_path) in enumerate(traversal):
+                if hasattr(model_field, "model"):  # Foreign key
                     if full_path not in lookups:
                         collection = (
                             model_field.model.meta.collection._collection.name
@@ -281,34 +406,27 @@ class CommonDAO(AsyncDAOProtocol):
                             "foreignField": "_id",
                             "as": full_path,
                         }
-                    current_model = model_field.model
-                    current_path = full_path
-
-                elif is_embedded_field(model_field):
-                    ann = getattr(model_field, "annotation", None)
-                    if get_origin(ann) is list:
-                        current_model = get_args(ann)[0]
-                    else:
-                        current_model = ann
-                    current_path = full_path
                     unwind_paths.add(full_path)
-
+                elif self.is_embedded_field(model_field):
+                    unwind_paths.add(full_path)
                 else:
-                    parent_path = ".".join(parts[:index])
+                    parent_path = ".".join(field_path.split(".")[:index])
                     if parent_path:
                         unwind_paths.add(parent_path)
                     break
 
-        # --- Parse and classify params ---
         for param_key, param_value in params.items():
-            base_field_path = param_key.split("__")[0]
-            if "." in base_field_path:
-                add_lookup_chain(base_field_path)
+            result = self.extract_field_and_operator(param_key, OPERATORS)
+            if not result:
+                continue
+            field, _ = result
+
+            if "." in field:
+                add_lookup_chain(field)
                 lookup_params[param_key] = param_value
             else:
                 base_params[param_key] = param_value
 
-        # --- Parse projections for additional lookups ---
         if projection:
             for projected_field in projection:
                 field_path = (
@@ -323,11 +441,9 @@ class CommonDAO(AsyncDAOProtocol):
                         parent_path = ".".join(parts[:i])
                         unwind_paths.add(parent_path)
 
-        # --- Init lookup stages safely ---
         lookup_stages = []
         added_unwinds = set()
 
-        # Unwind embedded paths (non-lookup)
         for path in sorted(unwind_paths):
             if path not in lookups and path not in added_unwinds:
                 lookup_stages.append(
@@ -340,18 +456,8 @@ class CommonDAO(AsyncDAOProtocol):
                 )
                 added_unwinds.add(path)
 
-        # Build lookup and unwind stages
         for full_path, lookup in lookups.items():
-            lookup_stages.append(
-                {
-                    "$lookup": {
-                        "from": lookup["from"],
-                        "localField": lookup["localField"],
-                        "foreignField": lookup["foreignField"],
-                        "as": lookup["as"],
-                    }
-                }
-            )
+            lookup_stages.append({"$lookup": lookup})
             if full_path not in added_unwinds:
                 lookup_stages.append(
                     {
@@ -363,160 +469,18 @@ class CommonDAO(AsyncDAOProtocol):
                 )
                 added_unwinds.add(full_path)
 
-        test = (lookup_stages, base_params, lookup_params, unwind_paths)
-
-        return lookup_stages, base_params, lookup_params, unwind_paths
-
-    def _extract_lookups_from_params_old(
-        self,
-        model,
-        params: Dict[str, Any],
-        projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
-    ) -> tuple[list[dict], dict, dict, set]:
-        """
-        Optimized dynamic deep lookup extractor with proper unwind handling.
-        - Dynamically builds MongoDB $lookup and $unwind stages for nested relations.
-        - Separates parameters into base fields and lookup fields.
-        """
-        if not params and not projection:
-            return [], {}, {}, set()
-
-        lookups = {}
-        base_params = {}
-        lookup_params = {}
-        unwind_paths = set()
-
-        def is_embedded_field(model_field) -> bool:
-            ann = getattr(model_field, "annotation", None)
-            if get_origin(ann) is Union:
-                args = get_args(ann)
-                non_none_args = [arg for arg in args if arg is not type(None)]
-                if len(non_none_args) == 1:
-                    ann = non_none_args[0]
-            if get_origin(ann) is list:
-                inner = get_args(ann)[0]
-                return hasattr(inner, "model_fields")
-            return hasattr(ann, "model_fields")
-
-        def add_lookup_chain(field_path: str):
-            parts = field_path.split(".")
-            current_model = model
-            current_path = ""
-
-            for index, part in enumerate(parts):
-                origin = get_origin(current_model)
-                if origin is Union:
-                    args = get_args(current_model)
-                    non_none_args = [
-                        arg for arg in args if arg is not type(None)
-                    ]
-                    if len(non_none_args) == 1:
-                        current_model = non_none_args[0]
-                        origin = get_origin(current_model)
-                if origin is list:
-                    current_model = get_args(current_model)[0]
-
-                model_fields = getattr(current_model, "model_fields", {})
-                model_field = model_fields.get(part)
-                if not model_field:
-                    break
-
-                full_path = f"{current_path}.{part}" if current_path else part
-
-                if hasattr(model_field, "model"):  # ForeignKey relation
-                    if full_path not in lookups:
-                        collection = (
-                            model_field.model.meta.collection._collection.name
-                        )
-                        lookups[full_path] = {
-                            "from": collection,
-                            "localField": full_path,
-                            "foreignField": "_id",
-                            "as": full_path,
-                        }
-                    current_model = model_field.model
-                    current_path = full_path
-
-                elif is_embedded_field(model_field):
-                    ann = getattr(model_field, "annotation", None)
-                    if get_origin(ann) is list:
-                        current_model = get_args(ann)[0]
-                    else:
-                        current_model = ann
-                    current_path = full_path
-                    unwind_paths.add(full_path)
-
-                else:
-                    parent_path = ".".join(parts[:index])
-                    if parent_path:
-                        unwind_paths.add(parent_path)
-                    break
-
-        # --- Parse and classify params ---
-        for param_key, param_value in params.items():
-            base_field_path = param_key.split("__")[0]
-            if "." in base_field_path:
-                add_lookup_chain(base_field_path)
-                lookup_params[param_key] = param_value
-            else:
-                base_params[param_key] = param_value
-
-        # --- Parse projections for additional lookups ---
+        used_fields = set()
+        for key in list(base_params) + list(lookup_params):
+            field, _ = self.extract_field_and_operator(key, OPERATORS)
+            used_fields.add(field)
         if projection:
-            for projected_field in projection:
-                field_path = (
-                    projected_field[0]
-                    if isinstance(projected_field, tuple)
-                    else projected_field
-                )
-                if "." in field_path:
-                    add_lookup_chain(field_path)
-                    parts = field_path.split(".")
-                    for i in range(1, len(parts)):
-                        parent_path = ".".join(parts[:i])
-                        unwind_paths.add(parent_path)
+            for proj in projection:
+                path = proj[0] if isinstance(proj, tuple) else proj
+                used_fields.add(path)
 
-        # --- Init lookup stages safely ---
-        lookup_stages = []
-        added_unwinds = set()
-
-        # Unwind embedded paths (non-lookup)
-        for path in sorted(unwind_paths):
-            if path not in lookups and path not in added_unwinds:
-                lookup_stages.append(
-                    {
-                        "$unwind": {
-                            "path": f"${path}",
-                            "preserveNullAndEmptyArrays": True,
-                        }
-                    }
-                )
-                added_unwinds.add(path)
-
-        # Build lookup and unwind stages
-        for full_path, lookup in lookups.items():
-            lookup_stages.append(
-                {
-                    "$lookup": {
-                        "from": lookup["from"],
-                        "localField": lookup["localField"],
-                        "foreignField": lookup["foreignField"],
-                        "as": lookup["as"],
-                    }
-                }
-            )
-            if full_path not in added_unwinds:
-                lookup_stages.append(
-                    {
-                        "$unwind": {
-                            "path": f"${full_path}",
-                            "preserveNullAndEmptyArrays": True,
-                        }
-                    }
-                )
-                added_unwinds.add(full_path)
-
-        test = (lookup_stages, base_params, lookup_params, unwind_paths)
+        add_fields = self.collect_choice_label_fields(model, used_fields)
+        if add_fields:
+            lookup_stages.append({"$addFields": add_fields})
 
         return lookup_stages, base_params, lookup_params, unwind_paths
 
@@ -530,7 +494,7 @@ class CommonDAO(AsyncDAOProtocol):
         additional_value: Optional[Dict[str, str]] = None,
         external_pipeline: Optional[List[Dict]] = None,
         is_total_count: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
         params = params or {}
         pipeline = []
         projection_stage = {}
@@ -559,9 +523,9 @@ class CommonDAO(AsyncDAOProtocol):
 
         # --- Match stage: Combine base and lookup filters ---
         if base_filters:
-            combined_query.update(self.query_builder(base_filters))
+            combined_query.update(await self.query_builder(base_filters))
         if lookup_filters:
-            combined_query.update(self.query_builder(lookup_filters))
+            combined_query.update(await self.query_builder(lookup_filters))
 
         if combined_query:
             pipeline.append({"$match": combined_query})
@@ -618,20 +582,25 @@ class CommonDAO(AsyncDAOProtocol):
 
             pipeline.append({"$group": group_stage})
 
-        if is_total_count:
-            count_pipeline = self.make_count_pipeline(pipeline)
-            count_result = await self.collection.aggregate(
-                count_pipeline
-            ).to_list(length=1)
-            total_count = count_result[0]["total_count"] if count_result else 0
+        # Handle filtered obj count
+        count_result = await self.aggregate(pipeline)
+        len_of_data = len(count_result)
+        filtered_data_count = len_of_data if len_of_data > 0 else 0
 
-            return {"results": [], "total_count": total_count}
+        if is_total_count:
+            return (filtered_data_count, [])
 
         # --- Pagination stages ---
-        # if skip_count:
-        #     pipeline.append({"$skip": skip_count})
-        # if limit_count:
-        #     pipeline.append({"$limit": limit_count})
+        if skip_count:
+            pipeline.append({"$skip": skip_count})
+        if limit_count:
+            pipeline.append({"$limit": limit_count})
+
+        data_result = await self.aggregate(pipeline)
+
+        results = [self.convert_to_serializable(doc) for doc in data_result]
+
+        return (filtered_data_count, results)
 
         # results = await self.collection.aggregate(
         #     pipeline, allowDiskUse=True
@@ -639,94 +608,314 @@ class CommonDAO(AsyncDAOProtocol):
 
         # return [self.convert_to_serializable(doc) for doc in results]
 
-        count_pipeline = self.make_count_pipeline(pipeline)
-        data_pipeline = pipeline.copy()
+    def _extract_lookups_from_params_old(
+        self,
+        model,
+        params: Dict[str, Any],
+        projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
+    ) -> tuple[list[dict], dict, dict, set]:
+        """
+        Optimized dynamic deep lookup extractor with proper unwind handling.
+        - Dynamically builds MongoDB $lookup and $unwind stages for nested relations.
+        - Separates parameters into base fields and lookup fields.
+        """
+        if not params and not projection:
+            return [], {}, {}, set()
 
-        if skip_count:
-            data_pipeline.append({"$skip": skip_count})
-        if limit_count:
-            data_pipeline.append({"$limit": limit_count})
+        lookups = {}
+        base_params = {}
+        lookup_params = {}
+        unwind_paths = set()
+        OPERATORS = settings.query_param_operators
 
-        count_result, data_result = await gather(
-            self.collection.aggregate(count_pipeline).to_list(length=1),
-            self.collection.aggregate(
-                data_pipeline, allowDiskUse=True
-            ).to_list(length=None),
-        )
+        def is_embedded_field(model_field) -> bool:
+            ann = getattr(model_field, "annotation", None)
+            if get_origin(ann) is Union:
+                args = get_args(ann)
+                non_none_args = [arg for arg in args if arg is not type(None)]
+                if len(non_none_args) == 1:
+                    ann = non_none_args[0]
+            if get_origin(ann) is list:
+                inner = get_args(ann)[0]
+                return hasattr(inner, "model_fields")
+            return hasattr(ann, "model_fields")
 
-        total_count = count_result[0]["total_count"] if count_result else 0
-        results = [self.convert_to_serializable(doc) for doc in data_result]
+        def add_lookup_chain(field_path: str):
+            parts = field_path.split(".")
+            current_model = model
+            current_path = ""
 
-        return results
+            for index, part in enumerate(parts):
+                origin = get_origin(current_model)
+                if origin is Union:
+                    args = get_args(current_model)
+                    non_none_args = [
+                        arg for arg in args if arg is not type(None)
+                    ]
+                    if len(non_none_args) == 1:
+                        current_model = non_none_args[0]
+                        origin = get_origin(current_model)
+                if origin is list:
+                    current_model = get_args(current_model)[0]
 
-    def add_extra_value_to_pipeline(
-        self, additional_value: Dict[str, str], pipeline: List[Dict[str, Any]]
-    ):
-        add_fields_stage = [
-            {
-                "$addFields": {
-                    field_name: {
-                        "$concat": [
-                            base_path,
-                            (
-                                f"${'.'.join(field_name.split('.')[:-1])}.{field_name.split('.')[-1]}"
-                                if "." in field_name
-                                else f"${field_name}"
-                            ),
-                        ]
+                model_fields = getattr(current_model, "model_fields", {})
+                model_field = model_fields.get(part)
+                if not model_field:
+                    break
+
+                full_path = f"{current_path}.{part}" if current_path else part
+
+                if hasattr(model_field, "model"):  # ForeignKey relation
+                    if full_path not in lookups:
+                        collection = (
+                            model_field.model.meta.collection._collection.name
+                        )
+                        lookups[full_path] = {
+                            "from": collection,
+                            "localField": full_path,
+                            "foreignField": "_id",
+                            "as": full_path,
+                        }
+                    current_model = model_field.model
+                    current_path = full_path
+
+                elif is_embedded_field(model_field):
+                    ann = getattr(model_field, "annotation", None)
+                    if get_origin(ann) is list:
+                        current_model = get_args(ann)[0]
+                    else:
+                        current_model = ann
+                    current_path = full_path
+                    unwind_paths.add(full_path)
+
+                else:
+                    parent_path = ".".join(parts[:index])
+                    if parent_path:
+                        unwind_paths.add(parent_path)
+                    break
+
+        # --- Parse and classify params ---
+        for param_key, param_value in params.items():
+            result = self.extract_field_and_operator(param_key, OPERATORS)
+            if not result:
+                continue
+            field, _ = result
+
+            if "." in field:
+                add_lookup_chain(field)
+                lookup_params[param_key] = param_value
+            else:
+                base_params[param_key] = param_value
+
+        # --- Parse projections for additional lookups ---
+        if projection:
+            for projected_field in projection:
+                field_path = (
+                    projected_field[0]
+                    if isinstance(projected_field, tuple)
+                    else projected_field
+                )
+                if "." in field_path:
+                    add_lookup_chain(field_path)
+                    parts = field_path.split(".")
+                    for i in range(1, len(parts)):
+                        parent_path = ".".join(parts[:i])
+                        unwind_paths.add(parent_path)
+
+        # --- Init lookup stages safely ---
+        lookup_stages = []
+        added_unwinds = set()
+
+        # Unwind embedded paths (non-lookup)
+        for path in sorted(unwind_paths):
+            if path not in lookups and path not in added_unwinds:
+                lookup_stages.append(
+                    {
+                        "$unwind": {
+                            "path": f"${path}",
+                            "preserveNullAndEmptyArrays": True,
+                        }
+                    }
+                )
+                added_unwinds.add(path)
+
+        # Build lookup and unwind stages
+        for full_path, lookup in lookups.items():
+            lookup_stages.append(
+                {
+                    "$lookup": {
+                        "from": lookup["from"],
+                        "localField": lookup["localField"],
+                        "foreignField": lookup["foreignField"],
+                        "as": lookup["as"],
                     }
                 }
-            }
-            for field_name, base_path in additional_value.items()
-        ]
-        pipeline.extend(add_fields_stage)
+            )
+            if full_path not in added_unwinds:
+                lookup_stages.append(
+                    {
+                        "$unwind": {
+                            "path": f"${full_path}",
+                            "preserveNullAndEmptyArrays": True,
+                        }
+                    }
+                )
+                added_unwinds.add(full_path)
 
-    def add_joined_fields_from_model(
+        return lookup_stages, base_params, lookup_params, unwind_paths
+
+    def _extract_lookups_from_params_old_1(
         self,
-        pipeline: List[Dict],
-        join_model,
-        common_fields: List[str],
-        joined_fields: List[str],
-    ):
-        let_expr = {field: f"${field}" for field in common_fields}
-        match_expr = {
-            "$expr": {
-                "$and": [
-                    {"$eq": [f"${field}", f"$${field}"]}
-                    for field in common_fields
-                ]
-            }
-        }
+        model,
+        params: Dict[str, Any],
+        projection: Optional[List[Union[str, Tuple[str, str]]]] = None,
+    ) -> tuple[list[dict], dict, dict, set]:
+        """
+        Optimized dynamic deep lookup extractor with proper unwind handling.
+        - Dynamically builds MongoDB $lookup and $unwind stages for nested relations.
+        - Separates parameters into base fields and lookup fields.
+        """
+        if not params and not projection:
+            return [], {}, {}, set()
 
-        lookup_stage = {
-            "$lookup": {
-                "from": join_model.Meta.collection._collection.name,
-                "let": let_expr,
-                "pipeline": [
-                    {"$match": match_expr},
-                    {"$project": {field: 1 for field in joined_fields}},
-                ],
-                "as": "ref_data",
-            }
-        }
+        lookups = {}
+        base_params = {}
+        lookup_params = {}
+        unwind_paths = set()
 
-        pipeline.extend(
-            [
-                lookup_stage,
-                {
-                    "$unwind": {
-                        "path": "$ref_data",
-                        "preserveNullAndEmptyArrays": True,
+        def is_embedded_field(model_field) -> bool:
+            ann = getattr(model_field, "annotation", None)
+            if get_origin(ann) is Union:
+                args = get_args(ann)
+                non_none_args = [arg for arg in args if arg is not type(None)]
+                if len(non_none_args) == 1:
+                    ann = non_none_args[0]
+            if get_origin(ann) is list:
+                inner = get_args(ann)[0]
+                return hasattr(inner, "model_fields")
+            return hasattr(ann, "model_fields")
+
+        def add_lookup_chain(field_path: str):
+            parts = field_path.split(".")
+            current_model = model
+            current_path = ""
+
+            for index, part in enumerate(parts):
+                origin = get_origin(current_model)
+                if origin is Union:
+                    args = get_args(current_model)
+                    non_none_args = [
+                        arg for arg in args if arg is not type(None)
+                    ]
+                    if len(non_none_args) == 1:
+                        current_model = non_none_args[0]
+                        origin = get_origin(current_model)
+                if origin is list:
+                    current_model = get_args(current_model)[0]
+
+                model_fields = getattr(current_model, "model_fields", {})
+                model_field = model_fields.get(part)
+                if not model_field:
+                    break
+
+                full_path = f"{current_path}.{part}" if current_path else part
+
+                if hasattr(model_field, "model"):  # ForeignKey relation
+                    if full_path not in lookups:
+                        collection = (
+                            model_field.model.meta.collection._collection.name
+                        )
+                        lookups[full_path] = {
+                            "from": collection,
+                            "localField": full_path,
+                            "foreignField": "_id",
+                            "as": full_path,
+                        }
+                    current_model = model_field.model
+                    current_path = full_path
+
+                elif is_embedded_field(model_field):
+                    ann = getattr(model_field, "annotation", None)
+                    if get_origin(ann) is list:
+                        current_model = get_args(ann)[0]
+                    else:
+                        current_model = ann
+                    current_path = full_path
+                    unwind_paths.add(full_path)
+
+                else:
+                    parent_path = ".".join(parts[:index])
+                    if parent_path:
+                        unwind_paths.add(parent_path)
+                    break
+
+        # --- Parse and classify params ---
+        for param_key, param_value in params.items():
+            base_field_path = param_key.split("__")[0]
+            if "." in base_field_path:
+                add_lookup_chain(base_field_path)
+                lookup_params[param_key] = param_value
+            else:
+                base_params[param_key] = param_value
+
+        # --- Parse projections for additional lookups ---
+        if projection:
+            for projected_field in projection:
+                field_path = (
+                    projected_field[0]
+                    if isinstance(projected_field, tuple)
+                    else projected_field
+                )
+                if "." in field_path:
+                    add_lookup_chain(field_path)
+                    parts = field_path.split(".")
+                    for i in range(1, len(parts)):
+                        parent_path = ".".join(parts[:i])
+                        unwind_paths.add(parent_path)
+
+        # --- Init lookup stages safely ---
+        lookup_stages = []
+        added_unwinds = set()
+
+        # Unwind embedded paths (non-lookup)
+        for path in sorted(unwind_paths):
+            if path not in lookups and path not in added_unwinds:
+                lookup_stages.append(
+                    {
+                        "$unwind": {
+                            "path": f"${path}",
+                            "preserveNullAndEmptyArrays": True,
+                        }
                     }
-                },
+                )
+                added_unwinds.add(path)
+
+        # Build lookup and unwind stages
+        for full_path, lookup in lookups.items():
+            lookup_stages.append(
                 {
-                    "$addFields": {
-                        field: f"$ref_data.{field}" for field in joined_fields
+                    "$lookup": {
+                        "from": lookup["from"],
+                        "localField": lookup["localField"],
+                        "foreignField": lookup["foreignField"],
+                        "as": lookup["as"],
                     }
-                },
-                {"$project": {"ref_data": 0}},
-            ]
-        )
+                }
+            )
+            if full_path not in added_unwinds:
+                lookup_stages.append(
+                    {
+                        "$unwind": {
+                            "path": f"${full_path}",
+                            "preserveNullAndEmptyArrays": True,
+                        }
+                    }
+                )
+                added_unwinds.add(full_path)
+
+        test = (lookup_stages, base_params, lookup_params, unwind_paths)
+
+        return lookup_stages, base_params, lookup_params, unwind_paths
 
     '''
     async def search0(
