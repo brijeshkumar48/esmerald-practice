@@ -4,7 +4,17 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 from bson import ObjectId
-from esmerald import Form, Query, Response, get, post, delete, Request, status
+from esmerald import (
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    get,
+    post,
+    delete,
+    Request,
+    status,
+)
 from app.commonDao import CommonDAO
 from app.llm_service import call_llm
 from app.models.app_models import (
@@ -290,15 +300,22 @@ async def stu_details(
         {"$project": {"ref_data": 0}},
     ]
 
-    stu = await student_dao.search(
+    stu_count, stu_obj = await student_dao.search(
         params=q,
-        group_by_field="_id",
         # is_total_count=True,
         projection=[
             "name",
             "std",
+            "roll_no",
+            "obtained_pct",
+            "is_pass",
             "section",
             "mobile_number",
+            ("school_id.university_id.body.body_name", "body_name"),
+            (
+                "school_id.university_id.body.country_id.country_name",
+                "body_country_name",
+            ),
             ("address.village", "village"),
             ("address.country_id.country_name", "country_name"),
             (
@@ -308,20 +325,14 @@ async def stu_details(
             ("school_id.name", "school_name"),
             ("school_id.board", "school_board"),
             ("school_id.university_id.un_name", "university_name"),
-            ("school_id.university_id.body.body_name", "body_name"),
-            (
-                "school_id.university_id.body.country_id.country_name",
-                "body_country_name",
-            ),
         ],
+        additional_value={"school_id.name": "TESTtt"},
         external_pipeline=external_pipeline,
     )
 
-    # formatted_data = transform_search_results(stu)
-
     return generate_response(
         request=request,
-        data=stu,
+        data={"total_count": stu_count, "result": stu_obj},
         message="Ok",
     )
 

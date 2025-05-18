@@ -27,13 +27,13 @@ class ForeignKey(FieldFactory, ObjectId):
                 for key, value in locals().items()
                 if key not in CLASS_DEFAULTS
             },
-            "null": null,
-            "json_schema_extra": {
-                "Meta": {
-                    "ref": model.__name__,
-                    "ref_model": model,
-                }
-            },
+            # "null": null,
+            # "json_schema_extra": {
+            #     "Meta": {
+            #         "ref": model.__name__,
+            #         "ref_model": model,
+            #     }
+            # },
         }
         return super().__new__(cls, **kwargs)
 
@@ -63,8 +63,19 @@ class UploadedMediaFile(BaseDocument):
         return "uploaded_media_file"
 
 
+ContinentChoices = (
+    ("AF", "Africa"),
+    ("AN", "Antarctica"),
+    ("AS", "Asia"),
+    ("EU", "Europe"),
+    ("NA", "North America"),
+    ("OC", "Oceania"),
+    ("SA", "South America"),
+)
+
+
 class Continent(BaseDocument):
-    continent_name: str = mongoz.String()
+    continent_name: str = String(max_length=20, choices=ContinentChoices)
     zone_id: ObjectId = ForeignKey(lambda: Zone)
 
     class Meta:
