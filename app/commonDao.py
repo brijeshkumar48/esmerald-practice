@@ -109,7 +109,7 @@ class CommonDAO(AsyncDAOProtocol):
         # --- Pagination ---
         skip_count = int(params.pop("skip", 0))
         limit_count = int(params.pop("pick", 0))
-        group_by_field = params.pop("group_by", "_id")
+        group_by_field = params.pop("group_by", None)
 
         # --- Sorting ---
         sort_param = params.pop("sort", None)
@@ -225,9 +225,15 @@ class CommonDAO(AsyncDAOProtocol):
         pipeline.append({"$project": {"_id": 0}})
 
         # --- Final fetch ---
-        data_result = await self.aggregate(pipeline)
-        results = [self.convert_to_serializable(doc) for doc in data_result]
-        return filtered_data_count, results
+        # data_result = await self.aggregate(pipeline)
+        # results = [self.convert_to_serializable(doc) for doc in data_result]
+        # return filtered_data_count, results
+        results = await self.aggregate(pipeline)
+
+        return (
+            filtered_data_count,
+            json.loads(json.dumps(results, default=lambda value: str(value))),
+        )
 
     def build_lookup_pipeline(
         self, model: Any, projections: List[Union[str, Tuple[str, str]]]
