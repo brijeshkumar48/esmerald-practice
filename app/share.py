@@ -1,3 +1,89 @@
+external_pipeline = [
+        # (
+        #     "school_id.university_id.body.country_id.country_name",
+        #     "body_country_name",
+        # )
+        {
+            "$addFields": {
+                "school_id_for_join": {
+                    "$ifNull": ["$school_id._id", "$school_id"]
+                }
+            }
+        },
+        {
+            "$lookup": {
+                "from": "schools",
+                "let": {"school_id": "$school_id_for_join"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$eq": ["$_id", "$$school_id"]}}},
+                    {"$project": {"university_id": 1}},
+                ],
+                "as": "school_data",
+            }
+        },
+        {"$unwind": "$school_data"},
+        {
+            "$addFields": {
+                "university_id_for_join": {
+                    "$ifNull": [
+                        "$school_data.university_id._id",
+                        "$school_data.university_id",
+                    ]
+                }
+            }
+        },
+        {
+            "$lookup": {
+                "from": "universities",
+                "let": {"university_id": "$university_id_for_join"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {"$eq": ["$_id", "$$university_id"]}
+                        }
+                    },
+                    {
+                        "$project": {
+                            "latest_body": {"$arrayElemAt": ["$body", -1]}
+                        }
+                    },
+                ],
+                "as": "university_data",
+            }
+        },
+        {"$unwind": "$university_data"},
+        {
+            "$addFields": {
+                "latest_body_country_id_for_join": {
+                    "$ifNull": [
+                        "$university_data.latest_body.country_id._id",
+                        "$university_data.latest_body.country_id",
+                    ]
+                }
+            }
+        },
+        {
+            "$lookup": {
+                "from": "countries",
+                "let": {"country_id": "$latest_body_country_id_for_join"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$eq": ["$_id", "$$country_id"]}}},
+                    {"$project": {"country_name": 1}},
+                ],
+                "as": "country_data",
+            }
+        },
+        {
+            "$unwind": {
+                "path": "$country_data",
+                "preserveNullAndEmptyArrays": True,
+            }
+        },
+        {"$addFields": {"body_country_name": "$country_data.country_name"}},
+    ]
+
+
+
 async def search(
         self,
         params: Dict[str, Any] = None,
