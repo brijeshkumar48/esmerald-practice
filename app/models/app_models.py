@@ -1,3 +1,5 @@
+import importlib
+from urllib.parse import urljoin
 from mongoz import String, Document, fields
 from typing import Annotated, Any, ClassVar, List, Optional, Type, Union
 import mongoz
@@ -9,6 +11,7 @@ from bson import ObjectId
 from mongoz import Document, EmbeddedDocument
 from mongoz.core.db.fields.core import FieldFactory, CLASS_DEFAULTS
 from mongoz.core.db.fields.base import BaseField
+from config.settings import settings
 
 
 class ForeignKey(FieldFactory, ObjectId):
@@ -16,7 +19,7 @@ class ForeignKey(FieldFactory, ObjectId):
 
     def __new__(
         cls,
-        model: Union[Type[Document], Type[EmbeddedDocument]],
+        refer_to: Union["Document", "EmbeddedDocument"],
         null: bool = False,
         **kwargs: Any,
     ) -> BaseField:
@@ -27,15 +30,55 @@ class ForeignKey(FieldFactory, ObjectId):
                 for key, value in locals().items()
                 if key not in CLASS_DEFAULTS
             },
-            # "null": null,
-            # "json_schema_extra": {
-            #     "Meta": {
-            #         "ref": model.__name__,
-            #         "ref_model": model,
-            #     }
-            # },
         }
-        return super().__new__(cls, **kwargs)
+        field = super().__new__(cls, **kwargs)
+
+        # Add lazy resolve method as a property
+        def lazy_resolve_model(
+            self: BaseField,
+        ) -> type[Union["Document", "EmbeddedDocument"]]:
+            if isinstance(self.refer_to, str):
+                module_path, class_name = self.refer_to.rsplit(".", 1)
+                module = importlib.import_module(module_path)
+                model = getattr(module, class_name)
+                return model
+            return self.refer_to
+
+        field.__class__.to = property(lazy_resolve_model)
+
+        return field
+
+
+class FilePath(FieldFactory):
+    def __new__(
+        cls, *, base_url: Optional[str] = None, **kwargs: Any
+    ) -> BaseField:
+        def resolve_base_url():
+            return base_url
+
+        field = String(**kwargs)
+        field._base_url = resolve_base_url()
+
+        def serialize(self, value: str) -> Optional[str]:
+            if value and not value.startswith("http"):
+                return urljoin(self._base_url, value)
+            return value
+
+        def deserialize(self, value: str) -> Optional[str]:
+            if value and value.startswith(self._base_url):
+                return value.replace(self._base_url, "")
+            return value
+
+        # Allow .url to always return the latest base_url
+        @property
+        def url(self) -> str:
+            return resolve_base_url()
+
+        field.serialize = serialize.__get__(field)
+        field.deserialize = deserialize.__get__(field)
+        setattr(field.__class__, "url", url)
+
+        return field
 
 
 FileUploadResultTypeChoices = (
@@ -76,7 +119,7 @@ ContinentChoices = (
 
 class Continent(BaseDocument):
     continent_name: str = String(max_length=20, choices=ContinentChoices)
-    zone_id: ObjectId = ForeignKey(lambda: Zone)
+    zone_id: ObjectId = ForeignKey("models.Zone")
 
     class Meta:
         registry = registry
@@ -134,6 +177,7 @@ class School(BaseDocument):
     name: str = mongoz.String()
     board: str = mongoz.String(choices=SchoolBoardChoices)
     university_id: ObjectId = ForeignKey(University)
+    logo: str = FilePath(base_url=settings.media_url)
 
     class Meta:
         registry = registry
@@ -187,6 +231,7 @@ class Student(BaseDocument):
     name: str = mongoz.String()
     std: str = mongoz.String()
     roll_no: int = mongoz.Integer()
+    profile_image: str = FilePath(base_url=settings.media_url)
     obtained_pct: float = mongoz.Decimal(decimal_places=5, max_digits=10)
     is_pass: bool = (mongoz.Boolean(),)
     mobile_number: str = mongoz.String()

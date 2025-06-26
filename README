@@ -1,0 +1,2 @@
+- docker env up command:
+    docker compose --env-file .env_docker up

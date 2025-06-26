@@ -384,6 +384,13 @@ async def stu_details(
         {"$addFields": {"body_country_name": "$country_data.country_name"}},
     ]
 
+    # supported_operators = {
+    #     "sw": "sw",
+    #     "ew": "ew",
+    # }
+
+    supported_operators = ["sw", "eb"]
+
     stu_count, stu_obj = await student_dao.search(
         params=q,
         # is_total_count=True,
@@ -391,28 +398,34 @@ async def stu_details(
             "name",
             "std",
             "roll_no",
+            "profile_image",
             "obtained_pct",
             "is_pass",
-            # "section",
-            # "body_country_name",
             "mobile_number",
             ("school_id.name", "school_name"),
-            ("school_id.board", "school_board"),
-            ("school_id.university_id.un_name", "university_name"),
-            ("school_id.university_id.body.body_name", "body_name"),
-            (
-                "school_id.university_id.body.country_id.country_name",
-                "body_country_name",
-            ),
-            ("address.village", "village"),
-            ("address.country_id.country_name", "country_name"),
-            (
-                "address.country_id.continent_id.continent_name",
-                "continent_name",
-            ),
+            ("school_id.logo", "school_logo"),
+            # ("school_id.university_id.un_name", "university_name"),
+            # "section",
+            # (
+            #     "address.country_id.continent_id.continent_name",
+            #     "continent_name",
+            # ),
+            # ("address.pincode", "pincode"),
+            # ("school_id.university_id.body.body_name", "body_name"),
+            # ("address.village", "village"),
+            # ("address.country_id.country_name", "country_name"),
+            # (
+            #     "school_id.university_id.body.country_id.country_name",
+            #     "body_country_name",
+            # ),
+            # (
+            #     "address.country_id.continent_id.zone.zone_name",
+            #     "zone_name",
+            # ),
         ],
         # additional_value={"school_id.name": "TESTtt"},
-        # external_pipeline=external_pipeline_body_country_name_latest,
+        # external_pipeline=external_pipeline,
+        # supported_operators=supported_operators,
     )
 
     return generate_response(
